@@ -1,0 +1,4 @@
+fn hello(x i32, y i32) i32: {
+    let z = x + y;
+    z + 2
+}

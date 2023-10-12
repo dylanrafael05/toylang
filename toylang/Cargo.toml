@@ -1,0 +1,21 @@
+[package]
+name = "toylang"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+lazy_static = "1.4.0"
+inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm16-0-prefer-dynamic"] }
+pest = "2.7.3"
+pest_derive = "2.7.3"
+toylang_derive = { path = "../toylang_derive" }
+concat-idents = "1.1.5"
+clap = { version = "4.4.6", features = ["derive"] }
+
+# speed up builds (?)
+[profile.dev] 
+opt-level = 1
+debug = 1
+incremental = true

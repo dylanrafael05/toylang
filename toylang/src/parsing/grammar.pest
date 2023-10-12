@@ -1,0 +1,115 @@
+// Basics
+and = {"and"}
+or = {"or"}
+not = {"not"}
+
+IF_KW = _{"if"}
+ELSE_KW = _{"else"}
+WHILE_KW = _{"while"}
+
+FN_KW = _{"fn"}
+LET_KW = _{"let"}
+MUT_KW = _{"mut"}
+
+AS_KW = _{"as"}
+
+ANY_KW = _{and | or | not | IF_KW | ELSE_KW | WHILE_KW | FN_KW | LET_KW | MUT_KW | AS_KW}
+
+ALPHA = _{('a'..'z') | ('A'..'Z') | "_"}
+DIGIT = _{'0' .. '9'}
+ALNUM = _{ALPHA | DIGIT}
+
+ident = @{!ANY_KW ~ ALPHA ~ ALNUM*}
+
+int_ty_spec = @{"i8" | "i32" | "i64" | "isize" | "u8" | "u32" | "u64" | "usize"}
+flt_ty_spec = @{"f32" | "f64"}
+
+integer = @{DIGIT+}
+decimal = @{DIGIT+ ~ "." ~ DIGIT+}
+
+typed_integer = @{integer ~ int_ty_spec}
+typed_decimal = @{decimal ~ flt_ty_spec}
+
+number = _{typed_decimal | decimal | typed_integer | integer}
+
+// Ignores
+WHITESPACE = _{" " | "\t" | NEWLINE}
+COMMENT_SIMPLE = _{"//" ~ (!NEWLINE ~ ANY)* ~ NEWLINE}
+COMMENT_BLOCK = _{"/" ~ PUSH("*"+) ~ (!(PEEK ~ "/") ~ ANY)* ~ POP ~ "/"}
+COMMENT = _{COMMENT_SIMPLE | COMMENT_BLOCK}
+
+// Expressions
+plus = {"+"}
+minus = {"-"}
+star = {"*"}
+slash = {"/"}
+amp = {"&"}
+
+equal = _{"="}
+dequal = {"=="}
+nequal = {"!="}
+greater = {">"}
+grequal = {">="}
+less = {"<"}
+lequal = {"<="}
+
+some_compare = _{dequal | nequal | greater | grequal | less | lequal}
+
+term = _{ident | number | ("(" ~ expr ~ ")") | block}
+comma_sep = _{(expr ~ ("," ~ expr)*)?}
+
+call = {term ~ "(" ~ comma_sep ~ ")"}
+call_step = _{call | term}
+
+unary_expr = {(minus | not) ~ unary_step}
+unary_step = _{unary_expr | call_step}
+
+as_expr = {unary_expr ~ "as" ~ type}
+as_step = _{as_expr | unary_step}
+
+muldiv_expr = {unary_step ~ (star | slash) ~ muldiv_step}
+muldiv_step = _{muldiv_expr | as_step}
+
+addsub_expr = {muldiv_step ~ (plus | minus) ~ addsub_step}
+addsub_step = _{addsub_expr | muldiv_step}
+
+comp_expr = {addsub_step ~ some_compare ~ comp_step}
+comp_step = _{comp_expr | addsub_step}
+
+or_expr = {comp_step ~ or ~ or_step}
+or_step = _{or_expr | comp_step}
+
+and_expr = {or_step ~ and ~ and_step}
+and_step = _{and_expr | or_step}
+
+else_clause = {ELSE_KW ~ block}
+elif_clause = {ELSE_KW ~ if_stmt}
+
+if_stmt = {IF_KW ~ expr ~ block ~ (else_clause | elif_clause)?}
+
+expr = _{and_step | if_stmt}
+
+// Statements
+ref_type = {amp ~ type}
+ptr_type = {star ~ type}
+type = {ident | ptr_type | ref_type}
+
+block_body = {(stmt ~ ";")*}
+block = {"{" ~ block_body ~ stmt? ~ "}"}
+while_stmt = {WHILE_KW ~ expr ~ block}
+
+let_stmt = {LET_KW ~ ident ~ optional_type ~ equal ~ expr}
+assgn_stmt = {ident ~ equal ~ expr}
+
+arg = {ident ~ type}
+args = {(arg ~ ("," ~ arg)*)?}
+
+optional_type = {type?}
+fn_stmt = {FN_KW ~ ident ~ "(" ~ args ~ ")" ~ optional_type ~ ":" ~ expr}
+
+stmt = _{fn_stmt | block | if_stmt | while_stmt | let_stmt | assgn_stmt | expr}
+
+// Top level statements
+top_lvl = _{fn_stmt}
+
+prog = _{top_lvl* ~ &EOI}
