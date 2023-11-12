@@ -1,4 +1,72 @@
-fn hello(x i32, y i32) i32: {
-    let z = x + y;
-    z + 2
+import "wow.txt"
+import "std:malloc.tl"
+
+declare fn puts(str *u8) i32
+
+declare fn free(_ *unit)
+
+fn int_to_str(n i32) *u8: {
+    let num = n;
+    let out = malloc(100 as isize) as *u8;
+
+    let mem = out;
+
+    while num != 0 {
+        *mem = 48 as u8 + ((num % 10) as u8);
+        num = num / 10;
+        mem = mem + 1;
+    };
+    
+    let memf = out;
+    let memb = mem - 1;
+
+    while memf != memb and memf != memb - 1 {
+        let tmp = *memf;
+        *memf = *memb;
+        *memb = tmp;
+
+        memf = memf + 1;
+        memb = memb - 1;
+    };
+
+    *mem = 0 as u8; 
+
+    out
+}
+
+fn main():
+{
+    puts("Hello, world!");
+
+    let a = add(1, 2);
+
+    let x = 10;
+    let xp = &x;
+
+    let y = *xp;
+
+    let ya = int_to_str(y);
+
+    puts(ya);
+}
+
+mod std
+{
+    struct Test
+    {
+        x i32,
+        y Test
+    }
+    
+    fn bruh() Test: {
+        let t = Test();
+        let x = t.x;
+        t
+    }
+}
+
+fn bruh() std::Test: {
+    let t = std::Test();
+    let x = t.x;
+    t
 }

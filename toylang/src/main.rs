@@ -1,86 +1,90 @@
-pub mod core;
-pub mod parsing;
+#![feature(min_specialization)]
+#![feature(trait_alias)]
+#![feature(try_trait_v2)]
+#![feature(generic_arg_infer)]
+
 pub mod binding;
+pub mod core;
 pub mod llvm;
+pub mod parsing;
+pub mod types;
 
 use std::ffi::OsString;
 
-use inkwell::{context::Context, targets::{TargetMachine, Target}};
+use inkwell::{
+    context::Context,
+    targets::{Target, TargetMachine},
+};
 use llvm::CodegenContext;
+use parsing::ast::Program;
+use termcolor::ColorChoice;
 pub use toylang_derive::*;
 
 use clap::Parser as CParser;
 
 #[derive(CParser, Debug)]
 #[command(author, version, about, long_about = None)]
-struct Args 
-{
+struct Args {
     /// File to compile
-    #[arg(short, long)]
-    file: OsString
+    file: OsString,
 }
 
-use crate::{binding::ProgramContext, parsing::ast::UnboundSymbol};
+use crate::binding::ProgramContext;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> 
-{
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    println!("{}", args.file.to_str().unwrap());
-    let ipt = std::fs::read_to_string(
-        std::fs::canonicalize(args.file).unwrap())
-        .expect("User should provide valid file");
-    let ipt = ipt.as_str();
-    
-    match parsing::ast::parse(ipt)
-    {
-        Ok(ast) =>
-        {
-            let mut ctx = ProgramContext::new();
+    let file = args.file;
 
-            let ast = ast.bind(&mut ctx);
+    let mut stdout = termcolor::StandardStream::stdout(ColorChoice::Always);
+    let mut ctx = ProgramContext::new();
 
-            let diags = ctx.diags.diagnostics();
-            if diags.is_empty()
-            {
-                Target::initialize_native(&Default::default()).expect("Native target works");
-                let target = Target::get_first().unwrap().create_target_machine(
-                    &TargetMachine::get_default_triple(), 
-                    TargetMachine::get_host_cpu_name().to_str().unwrap(), 
-                    TargetMachine::get_host_cpu_features().to_str().unwrap(), 
-                    inkwell::OptimizationLevel::Aggressive, 
-                    inkwell::targets::RelocMode::Default, 
-                    inkwell::targets::CodeModel::Default
-                ).expect("Creating the target should work!");
+    let mut prog = Program::new(
+        file.to_str().unwrap().to_owned(), 
+        &mut ctx);
+    let prog = prog.bind(&mut ctx);
 
-                let llvm_ctx = Context::create();
-                let mut codegen = CodegenContext::new(
-                    &llvm_ctx, 
-                    target
-                );
-                
-                codegen.build(ast, ctx);
+    let diags = ctx.diags.diagnostics();
+    for diag in diags {
+        diag.write(&mut stdout)?;
+    }
+    // exit(0);
+    // for def in ctx.defs.iter() {
+    //     println!("{:#?}", *def);
+    // }
+    // exit(0);
 
-                println!(
-                    "{}",
-                    codegen.module.print_to_string().to_str().unwrap()
-                );
-            }
-            else 
-            {
-                for diag in diags
-                {
-                    println!("{diag:?}")
-                }
-            }
+    if diags.is_empty() {
+        Target::initialize_native(&Default::default()).expect("Native target works");
+        let target = Target::get_first()
+            .unwrap()
+            .create_target_machine(
+                &TargetMachine::get_default_triple(),
+                TargetMachine::get_host_cpu_name().to_str().unwrap(),
+                TargetMachine::get_host_cpu_features().to_str().unwrap(),
+                inkwell::OptimizationLevel::Aggressive,
+                inkwell::targets::RelocMode::Default,
+                inkwell::targets::CodeModel::Default,
+            )
+            .expect("Creating the target should work!");
 
-            Ok(())
-        },
+        let llvm_ctx = Context::create();
+        let mut codegen = CodegenContext::new(&llvm_ctx, &target);
 
-        Err(e) => 
-        {
-            println!("{e}");
+        codegen.build(prog, ctx);
 
-            Err(Box::new(e))
+        println!("{}", codegen.module.print_to_string().to_str().unwrap());
+
+        let ex = codegen
+            .module
+            .create_jit_execution_engine(inkwell::OptimizationLevel::Default)
+            .unwrap();
+
+        let f = unsafe { ex.get_function::<unsafe extern "C" fn()>("main") }.unwrap();
+
+        unsafe {
+            f.call();
         }
     }
+
+    Ok(())
 }

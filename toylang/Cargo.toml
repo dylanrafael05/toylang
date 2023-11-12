@@ -13,9 +13,10 @@ pest_derive = "2.7.3"
 toylang_derive = { path = "../toylang_derive" }
 concat-idents = "1.1.5"
 clap = { version = "4.4.6", features = ["derive"] }
+termcolor = "1.3.0"
 
 # speed up builds (?)
-[profile.dev] 
+[profile.dev]
 opt-level = 1
-debug = 1
+debug = true
 incremental = true
