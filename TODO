@@ -1,0 +1,9 @@
+- Add generics
+- Add traits + impls
+- Add mutability
+- Add member functions
+- Add function pointers
+- Implement references
+- Add ADTs
+- Add pattern matching
+- Implement automatic dereferencing

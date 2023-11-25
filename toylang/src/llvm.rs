@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, borrow::Cow};
 
 use inkwell::{
     builder::Builder,
@@ -13,21 +13,20 @@ use inkwell::{
         AnyValue, AnyValueEnum, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
         IntValue,
     },
-    AddressSpace, FloatPredicate, IntPredicate,
+    AddressSpace, FloatPredicate, IntPredicate, basic_block::BasicBlock,
 };
 
 use crate::{
     binding::{
         BoundBlock, BoundExpr, BoundExprAST, BoundProgram, BoundStmt, BoundStmtAST, Definition,
-        DefinitionKind, Definitions, ProgramContext, Scope,
+        DefinitionKind, Definitions, ProgramContext, Scope, SymbolRef, RcList,
     },
     core::{
         arena::{ArenaID, ArenaRef, Arena},
         ops::ArithOp,
-        AsU64,
+        AsU64, collections::{stack::Stack, OneSidedCollection}, Ident,
     },
-    formatstr,
-    parsing::ast::{OwnedSymbol, Typed, TypedSymbol},
+    parsing::ast::{OwnedSymbol, Typed, TypedSymbol, Symbol},
     types::{IntType, LitType, Type, UIntType},
 };
 
@@ -36,6 +35,28 @@ pub struct CodegenTypes<'a> {
     pub target: &'a TargetMachine,
     pub module: Module<'a>,
     pub type_values: HashMap<ArenaID<Definition>, AnyTypeEnum<'a>>,
+    pub gen_ty_impls: HashMap<ArenaID<Definition>, HashMap<RcList<Type>, AnyTypeEnum<'a>>>,
+    pub gen_fn_impls: HashMap<ArenaID<Definition>, HashMap<RcList<Type>, AnyTypeEnum<'a>>>,
+    pub cur_gen_vals: (RcList<Type>, RcList<Type>)
+}
+
+pub struct CodegenLitTypes<'a> {
+    pub ctx: &'a Context,
+    pub target: &'a TargetMachine,
+    pub module: Module<'a>,
+    pub type_values: HashMap<ArenaID<Definition>, AnyTypeEnum<'a>>,
+}
+
+#[derive(Debug)]
+pub struct Loop<'a> {
+    pub cond: BasicBlock<'a>,
+    pub end:  BasicBlock<'a>
+}
+
+#[derive(Debug)]
+pub struct FnVal<'a> {
+    pub func: FunctionValue<'a>,
+    pub sym:  SymbolRef
 }
 
 pub struct CodegenContext<'a> {
@@ -43,9 +64,12 @@ pub struct CodegenContext<'a> {
     pub module: Module<'a>,
     pub builder: Builder<'a>,
     pub target: &'a TargetMachine,
-    pub cur_func: Option<FunctionValue<'a>>,
 
-    pub definition_values: HashMap<ArenaID<Definition>, AnyValueEnum<'a>>,
+    pub cur_func: Option<FunctionValue<'a>>,
+    pub cur_loop: Option<Loop<'a>>,
+
+    pub definition_values: HashMap<SymbolRef, AnyValueEnum<'a>>,
+    pub unfinished_fns: Stack<FnVal<'a>>,
 
     pub types: CodegenTypes<'a>,
 }
@@ -62,6 +86,14 @@ impl<'a> TLValue<'a> {
         match self {
             Unit => None,
             Value(x) => Some(x.clone()),
+        }
+    }
+
+    pub fn block(&self) -> Option<BasicBlock<'a>> {
+        use TLValue::*;
+        match self {
+            Unit => None,
+            Value(x) => x.as_instruction_value().and_then(|x| x.get_parent())
         }
     }
 }
@@ -126,23 +158,64 @@ impl<'a> CodegenTypes<'a> {
     pub fn new(ctx: &'a Context, target: &'a TargetMachine, module: Module<'a>) -> Self {
         Self {
             ctx,
-            module,
             target,
-            type_values: HashMap::new(),
+            module,
+            type_values:  HashMap::new(),
+            gen_ty_impls: HashMap::new(),
+            gen_fn_impls: HashMap::new(),
+            cur_gen_vals: (RcList::from([]), RcList::from([]))
         }
     }
 
+    pub fn transform(&self, typ: &mut Type) {
+        typ.replace_all(&self.cur_gen_vals.0, &self.cur_gen_vals.1)
+    }
+
+    // TODO: rename to differentiate between transforming in-place and transforming
+    // with clone?
+    pub fn transform_ref<'b>(&self, sym: &'b SymbolRef) -> Cow<'b, SymbolRef> {
+        sym.replace_all(&self.cur_gen_vals.0, &self.cur_gen_vals.1)
+    }
+
     pub fn get(&mut self, typ: &Type, defs: &Definitions, scopes: &Arena<Scope>) -> AnyTypeEnum<'a> {
-        match typ {
+        
+        // dbg!(typ.full_name(defs, scopes));
+
+        // TODO: remove this clone?
+        let mut typ = typ.clone();
+        self.transform(&mut typ);
+
+        // dbg!(typ.full_name(defs, scopes));
+        // dbg!(&self.cur_gen_vals);
+
+        match &typ {
+            Type::Gen(b, args) => {
+                self.gen_ty_impls
+                    .entry(*b)
+                    .or_insert(Default::default());
+
+                let args: RcList<_> = args.iter().map(Clone::clone).collect();
+
+                if !self.gen_ty_impls[b].contains_key(&args) {
+                    let mono = self.build_monomorphization(*b, &args, defs, scopes);
+
+                    self.gen_ty_impls.get_mut(b).unwrap().insert(args.clone(), mono);
+                }
+
+                self.gen_ty_impls[b][&args]
+            }
+
             Type::Literal(x) => self.build(x, defs, scopes),
+
             Type::Ref(r) => {
                 if !self.type_values.contains_key(r) {
                     let def = r.get(defs);
                     let name = def.name();
+                    dbg!(&*def);
                     let ty = self.build_named(
                         &def.as_ty()
                             .unwrap()
-                            .typ
+                            .inner_type
                             .get()
                             .expect("This should have already bene defined"),
                         defs,
@@ -158,6 +231,26 @@ impl<'a> CodegenTypes<'a> {
 
             Type::Error => panic!("Code with errors should never be compiled!"),
         }
+    }
+
+    pub fn build_monomorphization(
+        &mut self,
+        typ: ArenaID<Definition>,
+        args: &RcList<Type>,
+        defs: &Arena<Definition>,
+        scopes: &Arena<Scope>
+    ) -> AnyTypeEnum<'a> {
+        let typdef = typ.get(defs);
+        let typdef = typdef.as_ty().unwrap();
+
+        // should Type::Literal be nuked?
+        let mut typ = Type::Literal(typdef.inner_type.get().unwrap().clone());
+
+        for (arg, gen) in args.iter().zip(typdef.gen_args.iter()) {
+            typ.replace(gen, arg);
+        }
+
+        self.get(&typ, defs, scopes)
     }
 
     pub fn build_named(
@@ -182,7 +275,7 @@ impl<'a> CodegenTypes<'a> {
 
             _ => panic!(
                 "Cannot build a named type from literal type {}",
-                typ.to_string(defs, scopes)
+                typ.full_name(defs, scopes)
             ),
         }
     }
@@ -217,7 +310,7 @@ impl<'a> CodegenTypes<'a> {
                     .map(|x| BasicTypeEnum::try_from(self.get(x, &defs, &scopes)).unwrap().into())
                     .collect::<Vec<_>>()
                     .as_slice(),
-                false,
+                fty.vararg,
             )
             .into(),
 
@@ -232,7 +325,7 @@ impl<'a> CodegenTypes<'a> {
                 )
                 .as_any_type_enum(),
 
-            x => todo!("{} cannot yet be built", x.to_string(&defs, &scopes)),
+            x => todo!("{} cannot yet be built", x.full_name(&defs, &scopes)),
         }
     }
 
@@ -258,88 +351,139 @@ impl<'a> CodegenContext<'a> {
             target,
 
             cur_func: None,
+            cur_loop: None,
+
             definition_values: HashMap::new(),
 
             types: CodegenTypes::new(ctx, &target, module.clone()),
+            unfinished_fns: Stack::new(),
 
             module,
         }
     }
 
-    pub fn build(&mut self, _prog: BoundProgram, mut ctx: ProgramContext) {
-        let mut fndefs = Vec::new();
+    pub fn get_fn(&mut self, ctx: &mut ProgramContext, symbol: &SymbolRef) -> FunctionValue<'a> {
+        if self.definition_values.contains_key(symbol) {
+            self.definition_values[symbol].into_function_value()
+        } else {
+            let ty = symbol.get_type(&ctx.defs, &ctx.scopes.arena);
+            let name = symbol.compiled_name(&ctx.defs, &ctx.scopes.arena);
 
-        for def in ctx.defs.iter() {
-            let id = ArenaRef::id(&def);
-            let name = def.compiled_name(&ctx.scopes.arena);
-            let def = match def.as_fn() {
-                Some(x) => x,
-                None => continue,
-            };
+            dbg!(symbol);
+            dbg!(&name);
+            
+            let ty = self.types.build(ty.must_lit(), &ctx.defs, &ctx.scopes.arena);
 
-            let ty = self.types.build(def.get_type().must_lit(), &ctx.defs, &ctx.scopes.arena);
-            let func = self
+            let fnval = self
                 .module
-                .add_function(name.as_str(), ty.into_function_type(), None);
+                .add_function(&name, ty.into_function_type(), None);
 
-            self.definition_values.insert(id, func.into());
+            dbg!(&fnval);
 
-            fndefs.push(id);
+            if !symbol.id().get(&ctx.defs).as_fn().unwrap().is_declare() {
+                self.unfinished_fns.push(FnVal { func: fnval, sym: symbol.clone() });
+            }
+
+            self.definition_values.insert(symbol.clone(), fnval.as_any_value_enum());
+
+            fnval
         }
+    }
 
-        for def in fndefs.into_iter() {
-            let def = def.take(&mut ctx.defs).into_value();
-            let name = def.compiled_name(&ctx.scopes.arena);
-            let def = match def.into_fn() {
-                Some(x) => x,
-                None => continue,
-            };
+    pub fn build(&mut self, _prog: BoundProgram, mut ctx: ProgramContext) {
 
-            if def.body_info.is_none() {
-                continue;
-            }
+        let main = ctx.scopes.lookup(&Ident::new("main"))
+            .unwrap();
 
-            let cur_func = self.module.get_function(name.as_str()).unwrap();
-            self.cur_func = Some(cur_func);
-            let entry = self.ctx.append_basic_block(cur_func, "entry");
+        let main = SymbolRef::Basic(main);
+        self.get_fn(&mut ctx, &main);
 
-            self.builder.position_at_end(entry);
-
-            let body_info = def.body_info.unwrap();
-
-            for (i, arg) in body_info.argdefs.iter().enumerate() {
-                self.definition_values.insert(
-                    *arg,
-                    cur_func
-                        .get_nth_param(i as u32)
-                        .unwrap()
-                        .as_any_value_enum(),
-                );
-            }
-
-            for (_, def) in body_info.scope.get(&ctx.scopes.arena).definitions() {
-                let def = def.get(&ctx.defs);
-
-                if !matches!(ArenaRef::as_ref(&def).kind, DefinitionKind::Variable(..)) {
-                    continue;
+        while !self.unfinished_fns.is_empty() {
+            let fns = self.unfinished_fns.drain().collect::<Vec<_>>();
+            dbg!(&self.unfinished_fns);
+            
+            for fnval in fns {
+                if let Some(args) = fnval.sym.gen_args(&ctx.defs) {
+                    self.types.cur_gen_vals = (args.0.clone(), args.1.clone());
                 }
 
-                let ty = self.types.build(def.get_type().must_lit(), &ctx.defs, &ctx.scopes.arena);
-                self.definition_values.insert(
-                    ArenaRef::id(&def),
-                    self.builder
-                        .build_alloca(BasicTypeHelper::from(ty), def.name().as_str())
-                        .unwrap()
-                        .as_any_value_enum(),
-                );
+                let entry = self.ctx.append_basic_block(fnval.func, "entry");
+                self.cur_func = Some(fnval.func);
+
+                self.builder.position_at_end(entry);
+
+                let def = fnval.sym.id();
+                let def = def.take(&mut ctx.defs);
+                let def = def.into_value().into_fn().unwrap();
+
+                let body_info = def.body_info.unwrap();
+
+                for (i, arg) in body_info.argdefs.iter().enumerate() {
+                    self.definition_values.insert(
+                        arg.into(),
+                        fnval.func
+                            .get_nth_param(i as u32)
+                            .unwrap()
+                            .as_any_value_enum(),
+                    );
+                }
+
+                for (_, def) in body_info.scope.get(&ctx.scopes.arena).definitions() {
+                    let def = def.get(&ctx.defs);
+
+                    if !matches!(ArenaRef::as_ref(&def).kind, DefinitionKind::Variable(..)) {
+                        continue;
+                    }
+
+                    let ty = self.types.build(def.get_type().must_lit(), &ctx.defs, &ctx.scopes.arena);
+                    self.definition_values.insert(
+                        ArenaRef::id(&def).into(),
+                        self.builder
+                            .build_alloca(BasicTypeHelper::from(ty), def.name().as_str())
+                            .unwrap()
+                            .as_any_value_enum(),
+                    );
+                }
+
+                let is_terminal = body_info.body_ast.kind().is_terminator();
+                let eval = self.build_expr(body_info.body_ast, &mut ctx).as_inner();
+
+                if !is_terminal {
+                    if fnval.func.get_name().to_str().unwrap() == "main" {
+                        let exit = self.module.add_function(
+                            "exit", 
+                            self.ctx.void_type().fn_type(&[self.ctx.i32_type().into()], false), 
+                            None
+                        );
+                        self.builder.build_call(exit, &[self.ctx.i32_type().const_zero().into()], "").unwrap();
+                        self.builder.build_unreachable().unwrap();
+                    } else {
+                        self.builder
+                            .build_return(eval.as_ref().map(|x| x as &dyn BasicValue))
+                            .unwrap();
+                    }
+                }
+                
+                self.types.cur_gen_vals = (RcList::from([]), RcList::from([]));
+                self.cur_func = None;
             }
-
-            let eval = self.build_expr(body_info.body_ast, &mut ctx).as_inner();
-
-            self.builder
-                .build_return(eval.as_ref().map(|x| x as &dyn BasicValue))
-                .unwrap();
         }
+
+        // TODO: propogate associated generics: switch to finding monomorphisms at the llvm build step
+        // to reduce the complexity of finding all monomorphisms. This can be a part of the following:
+
+        // TODO: implement a breadth-first-traversal of calls to prevent unnecessary functions from being compiled.
+        // use a stack of to-be-defined function declarations to prevent builder positioning from being spoiled,
+        // as well as to prevent recursion.
+        
+        // TODO: create a universal identifier type so that { func } and { generic_func::[i32] } can be represented
+        // as one in the same, reducing code bloat.
+
+        // TODO: consider ways to reduce cloning of types
+
+        // TODO: potentially switch to `Rc<[Type]>` for generic arguments, since they are shared
+
+        // TODO: actually implement type inference!
     }
 
     pub fn build_stmt(&mut self, stmt: BoundStmtAST, ctx: &mut ProgramContext) {
@@ -364,14 +508,14 @@ impl<'a> CodegenContext<'a> {
                 let target_v = target.get(&ctx.defs);
                 let ty = self.types.get(target_v.get_type(), &ctx.defs, &ctx.scopes.arena);
                 self.definition_values.insert(
-                    target,
+                    target.into(),
                     self.builder
                         .build_alloca(BasicTypeHelper::from(ty), target_v.name().as_str())
                         .unwrap()
                         .as_any_value_enum(),
                 );
 
-                let dval = self.definition_values[&target].into_pointer_value();
+                let dval = self.definition_values[&target.into()].into_pointer_value();
                 let vval = self.build_expr(*value, ctx);
 
                 self.builder
@@ -394,15 +538,17 @@ impl<'a> CodegenContext<'a> {
             BoundStmt::While { cond, block } => {
                 let cond_bb = self
                     .ctx
-                    .append_basic_block(self.cur_func.unwrap(), formatstr!("cond_{}", span.start));
+                    .append_basic_block(self.cur_func.unwrap(), "");
 
                 let loop_bb = self
                     .ctx
-                    .append_basic_block(self.cur_func.unwrap(), formatstr!("loop_{}", span.start));
+                    .append_basic_block(self.cur_func.unwrap(), "");
 
                 let exit_bb = self
                     .ctx
-                    .append_basic_block(self.cur_func.unwrap(), formatstr!("exit_{}", span.start));
+                    .append_basic_block(self.cur_func.unwrap(), "");
+
+                self.cur_loop = Some(Loop{ cond: cond_bb, end: exit_bb });
 
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
 
@@ -413,19 +559,64 @@ impl<'a> CodegenContext<'a> {
                     .unwrap()
                     .into_int_value();
 
-                self.builder
-                    .build_conditional_branch(cond, loop_bb, exit_bb)
-                    .unwrap();
+                if self.block_unterminated() {
+                    self.builder
+                        .build_conditional_branch(cond, loop_bb, exit_bb)
+                        .unwrap();
+                }
 
                 self.builder.position_at_end(loop_bb);
+
                 self.build_block(block, ctx);
 
-                self.builder.build_unconditional_branch(cond_bb).unwrap();
+                if self.block_unterminated() {
+                    self.builder.build_unconditional_branch(cond_bb).unwrap();
+                }
+                
+                self.cur_loop = None;
 
                 self.builder.position_at_end(exit_bb);
             }
+            
+            BoundStmt::Return(expr) => {
+                let expr = expr.map(|expr| BoundExprAST {
+                    span,
+                    content: Typed::<BoundExpr>::new(typ, expr),
+                });
 
+                let expr = match expr {
+                    Some(x) => {
+                        Some(self.build_expr(x, ctx).as_inner().unwrap())
+                    }
+
+                    None => None
+                };
+
+                self.builder.build_return(expr.as_ref().map(|x| x as &dyn BasicValue<'a>))
+                    .unwrap();
+            }
+
+            BoundStmt::Continue => {
+                self.builder.build_unconditional_branch(self.cur_loop.as_ref().unwrap().cond)
+                    .unwrap();
+            }
+
+            BoundStmt::Break => {
+                self.builder.build_unconditional_branch(self.cur_loop.as_ref().unwrap().end)
+                    .unwrap();
+            }
+            
             x => todo!("{x:?}"),
+        }
+    }
+
+    pub fn build_fn_val(&mut self, expr: BoundExpr, ctx: &mut ProgramContext) -> AnyValueEnum<'a> {
+        match expr {
+            BoundExpr::Fn(mut sym) => {
+                self.get_fn(ctx, &self.types.transform_ref(&mut sym)).as_any_value_enum()
+            }
+
+            _ => panic!("Cannot build {expr:?} as a function value")
         }
     }
 
@@ -435,7 +626,11 @@ impl<'a> CodegenContext<'a> {
         }
 
         if let Some(expr) = block.tail {
-            self.build_expr(*expr, ctx)
+            if self.block_unterminated() {
+                self.build_expr(*expr, ctx)
+            } else {
+                TLValue::Unit
+            }
         } else {
             TLValue::Unit
         }
@@ -479,14 +674,20 @@ impl<'a> CodegenContext<'a> {
 
             _ => panic!(
                 "Unimplemented equality-comparable type {}",
-                ty.to_string(&ctx.defs, &ctx.scopes.arena)
+                ty.full_name(&ctx.defs, &ctx.scopes.arena)
             ),
         }
     }
 
+    fn cur_block(&self) -> BasicBlock<'a> {
+        self.builder.get_insert_block().unwrap()
+    }
+    fn block_unterminated(&self) -> bool {
+        self.cur_block().get_terminator().is_none()
+    }
+
     fn build_expr(&mut self, expr: BoundExprAST, ctx: &mut ProgramContext) -> TLValue<'a> {
         let ty = expr.get_type().clone();
-        let span = expr.span.clone();
 
         let kind = expr.into_kind();
 
@@ -504,12 +705,20 @@ impl<'a> CodegenContext<'a> {
                 .into_float_type()
                 .const_float(x)
                 .into(),
+            
+            BoundExpr::Sizeof(ty) => {
+                let usize = self.types.build(&LitType::UInt(UIntType::USize), &ctx.defs, &ctx.scopes.arena);
+                let ty = self.types.get(&ty, &ctx.defs, &ctx.scopes.arena);
+
+                let sz = ty.size_of().unwrap();
+                sz.const_cast(usize.into_int_type(), false).into()
+            }
 
             BoundExpr::Block(x) => self.build_block(x, ctx),
 
             BoundExpr::Symbol(x) => match ArenaRef::as_ref(&x.get(&ctx.defs)).kind {
                 DefinitionKind::Parameter(..) => {
-                    BasicValueHelper::from(self.definition_values[&x]).into()
+                    BasicValueHelper::from(self.definition_values[&x.into()]).into()
                 }
                 DefinitionKind::Variable(ref typ) => {
                     let typ = self.types.get(typ, &ctx.defs, &ctx.scopes.arena);
@@ -517,7 +726,7 @@ impl<'a> CodegenContext<'a> {
                     self.builder
                         .build_load(
                             BasicTypeHelper::from(typ),
-                            self.definition_values[&x].into_pointer_value(),
+                            self.definition_values[&x.into()].into_pointer_value(),
                             "",
                         )
                         .expect("")
@@ -552,7 +761,7 @@ impl<'a> CodegenContext<'a> {
 
                     _ => todo!(
                         "Unimplemented signed arithmetic type {}",
-                        ty.to_string(&ctx.defs, &ctx.scopes.arena)
+                        ty.full_name(&ctx.defs, &ctx.scopes.arena)
                     ),
                 }
             }
@@ -572,6 +781,8 @@ impl<'a> CodegenContext<'a> {
             }
 
             BoundExpr::Comparison(bin, op) => {
+                let ty = bin.lhs.get_type().clone();
+                
                 let lhs = self.build_expr(*bin.lhs, ctx).as_inner().unwrap();
                 let rhs = self.build_expr(*bin.rhs, ctx).as_inner().unwrap();
 
@@ -616,7 +827,7 @@ impl<'a> CodegenContext<'a> {
                             .into()
                     }
 
-                    _ => todo!("Unimplemented arithmetic type {}", ty.to_string(&ctx.defs, &ctx.scopes.arena)),
+                    _ => todo!("Unimplemented arithmetic type {}", ty.full_name(&ctx.defs, &ctx.scopes.arena)),
                 }
             }
 
@@ -646,9 +857,11 @@ impl<'a> CodegenContext<'a> {
                     })
                     .collect::<Vec<_>>();
 
+                let func = self.build_fn_val(ex.into_kind(), ctx);
+
                 self.builder
                     .build_call(
-                        self.definition_values[&ex].into_function_value(),
+                        func.into_function_value(),
                         args.as_slice(),
                         "",
                     )
@@ -738,7 +951,7 @@ impl<'a> CodegenContext<'a> {
                     .unwrap()
                     .into(),
 
-                    _ => todo!("Unimplemented arithmetic type {}", ty.to_string(&ctx.defs, &ctx.scopes.arena)),
+                    _ => todo!("Unimplemented arithmetic type {}", ty.full_name(&ctx.defs, &ctx.scopes.arena)),
                 }
             }
 
@@ -751,12 +964,10 @@ impl<'a> CodegenContext<'a> {
                     .into_int_value();
 
                 let fallthrough = self.ctx.append_basic_block(
-                    self.cur_func.unwrap(),
-                    formatstr!("on_first_true_{}", span.start),
+                    self.cur_func.unwrap(), ""
                 );
                 let end = self.ctx.append_basic_block(
-                    self.cur_func.unwrap(),
-                    formatstr!("on_end_and_{}", span.start),
+                    self.cur_func.unwrap(), ""
                 );
 
                 self.builder
@@ -794,12 +1005,10 @@ impl<'a> CodegenContext<'a> {
                     .into_int_value();
 
                 let fallthrough = self.ctx.append_basic_block(
-                    self.cur_func.unwrap(),
-                    formatstr!("on_first_false_{}", span.start),
+                    self.cur_func.unwrap(), ""
                 );
                 let end = self.ctx.append_basic_block(
-                    self.cur_func.unwrap(),
-                    formatstr!("on_end_or_{}", span.start),
+                    self.cur_func.unwrap(), ""
                 );
 
                 self.builder
@@ -831,21 +1040,23 @@ impl<'a> CodegenContext<'a> {
             BoundExpr::If(bound_if) => {
                 let comp = self.build_expr(*bound_if.cond, ctx);
 
+                if !self.block_unterminated() {
+                    return TLValue::Unit;
+                }
+
                 let on_true = self.ctx.append_basic_block(
-                    self.cur_func.unwrap(),
-                    formatstr!("on_true_{}", span.start),
+                    self.cur_func.unwrap(), "",
                 );
 
                 let end_if = self
                     .ctx
-                    .append_basic_block(self.cur_func.unwrap(), formatstr!("endif_{}", span.start));
+                    .append_basic_block(self.cur_func.unwrap(), "");
 
-                let on_false = if bound_if.else_block.is_some() {
+                let on_false = if bound_if.else_block.is_none() {
                     end_if.clone()
                 } else {
                     self.ctx.append_basic_block(
-                        self.cur_func.unwrap(),
-                        formatstr!("on_false_{}", span.start),
+                        self.cur_func.unwrap(), "",
                     )
                 };
 
@@ -859,12 +1070,17 @@ impl<'a> CodegenContext<'a> {
 
                 self.builder.position_at_end(on_true);
                 let block_value = self.build_block(bound_if.block, ctx);
-                self.builder.build_unconditional_branch(end_if).unwrap();
+                if self.block_unterminated() {
+                    self.builder.build_unconditional_branch(end_if).unwrap();
+                }
 
                 let else_value = if let Some(else_block) = bound_if.else_block {
                     self.builder.position_at_end(on_false);
                     let val = self.build_expr(*else_block, ctx);
-                    self.builder.build_unconditional_branch(end_if).unwrap();
+
+                    if self.block_unterminated() {
+                        self.builder.build_unconditional_branch(end_if).unwrap();
+                    }
 
                     val
                 } else {
@@ -877,12 +1093,12 @@ impl<'a> CodegenContext<'a> {
                     let ty = self.types.get(&ty, &ctx.defs, &ctx.scopes.arena);
                     let phi = self
                         .builder
-                        .build_phi(BasicTypeHelper::from(ty), formatstr!("phi_{}", span.start))
+                        .build_phi(BasicTypeHelper::from(ty), "")
                         .expect("phi construction should not fail");
 
                     phi.add_incoming(&[
-                        (&block_value.as_inner().unwrap(), on_true),
-                        (&else_value.as_inner().unwrap(), on_false),
+                        (&block_value.as_inner().unwrap(), block_value.block().unwrap_or(on_true)),
+                        (&else_value.as_inner().unwrap(), else_value.block().unwrap_or(on_false)),
                     ]);
 
                     phi.as_basic_value().into()
@@ -891,8 +1107,10 @@ impl<'a> CodegenContext<'a> {
                 }
             }
 
-            BoundExpr::Cast(op, opty) => {
-                self.build_cast(*op, ty.into_lit().unwrap(), opty.into_lit().unwrap(), ctx)
+            BoundExpr::Cast(op, mut castty) => {
+                self.types.transform(&mut castty);
+                let opty = op.get_type().clone();
+                self.build_cast(*op, castty.into_lit().unwrap(), opty.into_lit().unwrap(), ctx)
             }
 
             BoundExpr::Dot(op, i) => {
@@ -907,19 +1125,34 @@ impl<'a> CodegenContext<'a> {
                     .unwrap()
                     .into()
             }
+            
+            BoundExpr::DotRef(op, i) => {
+                let ty = op.get_type().deref().unwrap().clone();
+                let op = self.build_expr(*op, ctx);
+
+                self.builder
+                    .build_struct_gep(
+                        BasicTypeHelper::from(self.types.get(&ty, &ctx.defs, &ctx.scopes.arena).as_any_type_enum()),
+                        op.as_inner().unwrap().into_pointer_value(),
+                        i as u32,
+                        ""
+                    )
+                    .unwrap()
+                    .into()
+            }
 
             BoundExpr::Deref(op) => {
-                let ty = self.types.get(op.get_type().ptr_val().unwrap(), &ctx.defs, &ctx.scopes.arena);
+                let ty = self.types.get(op.get_type().deref().unwrap(), &ctx.defs, &ctx.scopes.arena);
                 let op = self.build_expr(*op, ctx);
 
                 self.builder
                     .build_load(BasicTypeHelper::from(ty), op.as_inner().unwrap().into_pointer_value(), "")
-                    .expect("Building load should word")
+                    .expect("Building load should work")
                     .into()
             }
 
             BoundExpr::VariableRef(id) => {
-                BasicValueHelper::from(self.definition_values[&id]).into()
+                BasicValueHelper::from(self.definition_values[&id.into()]).into()
             }
 
             BoundExpr::DerefRef(x) 
@@ -930,7 +1163,11 @@ impl<'a> CodegenContext<'a> {
                 BasicTypeHelper::from(ty).const_zero().into()
             }
 
-            x => todo!("{:?}", x),
+            BoundExpr::Error | BoundExpr::None | BoundExpr::Type(..) => TLValue::Unit,
+
+            BoundExpr::IndirectCall(..) => todo!(),
+
+            BoundExpr::Fn(..) => panic!("Cannot build {kind:?} as a value")
         }
     }
 
@@ -943,11 +1180,11 @@ impl<'a> CodegenContext<'a> {
     ) -> TLValue<'a> {
         let op = self.build_expr(op, ctx).as_inner().unwrap();
 
-        let oty = self.types.build(&opty, &ctx.defs, &ctx.scopes.arena);
+        let oty = self.types.build(&ty, &ctx.defs, &ctx.scopes.arena);
 
         use LitType::*;
 
-        match (opty, ty) {
+        match dbg!((opty, ty)) {
             (Int(..) | UInt(..), Int(..)) => self
                 .builder
                 .build_int_cast_sign_flag(op.into_int_value(), oty.into_int_type(), true, "")
@@ -984,18 +1221,21 @@ impl<'a> CodegenContext<'a> {
                 .unwrap()
                 .into(),
 
-            (Int(..) | UInt(..), Ptr(..)) => self
+            (Int(..) | UInt(..), Ptr(..)) => {
+                println!("CONVERSIONNNNNN!");
+                self
                 .builder
                 .build_int_to_ptr(op.into_int_value(), oty.into_pointer_type(), "")
                 .unwrap()
-                .into(),
+                .into()
+            }
 
             (Ptr(..), Ptr(..)) => op.into(),
 
             (i, o) => panic!(
                 "Unknown cast of {} -> {}",
-                i.to_string(&ctx.defs, &ctx.scopes.arena),
-                o.to_string(&ctx.defs, &ctx.scopes.arena)
+                i.full_name(&ctx.defs, &ctx.scopes.arena),
+                o.full_name(&ctx.defs, &ctx.scopes.arena)
             ),
         }
     }

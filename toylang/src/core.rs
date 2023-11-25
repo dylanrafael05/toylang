@@ -3,6 +3,9 @@ pub mod lazy;
 pub mod many;
 pub mod monad;
 pub mod ops;
+pub mod utils;
+pub mod prehashed;
+pub mod collections;
 
 use std::{fmt::{Debug, Display}, ops::{Add, Index, Range}, rc::Rc, sync::Arc, io::{self, Write}};
 
@@ -108,6 +111,10 @@ impl Ident {
 
     pub fn to_string(&self) -> String {
         self.0.to_string()
+    }
+
+    pub fn new<'a>(x: impl Into<&'a str>) -> Self {
+        Self(Rc::from(x.into()))
     }
 }
 

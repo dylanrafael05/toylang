@@ -1,14 +1,19 @@
+use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::io;
 use std::ops::Deref;
 use std::path::Path;
+use std::rc::Rc;
+use hashlink::LinkedHashMap;
 use toylang_derive::Symbol;
 
 use crate::core::arena::{Arena, ArenaID, ArenaMut, ArenaRef, ArenaValue};
 use crate::core::lazy::OnceBuildable;
 use crate::core::monad::Wrapper;
 use crate::core::ops::{ArithOp, BinOp, CompOp, ConstFloat, ConstInt, Constant, UnOp};
+use crate::core::utils::{Itertools, FlagCell};
 use crate::core::{Diagnostic, Ident, SourceSpan, Src};
 use crate::parsing;
 use crate::parsing::ast::{
@@ -16,7 +21,7 @@ use crate::parsing::ast::{
     Typed, TypedSymbol, UnboundSymbol, AST, ExprAST, Program,
 };
 use crate::types::{
-    FloatType, FunctionType, IntType, LitType, RefKind, Type, TypeDefinition, UIntType,
+    FloatType, FunctionType, IntType, LitType, RefKind, Type, TypeDefinition, UIntType, DotError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,12 +43,37 @@ impl Display for ComptimeType {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct GenericInfo {
+    pub args: RcList<Type>
+}
+
+impl GenericInfo {
+    pub fn new() -> Self {
+        Self {
+            args: Rc::new([])
+        }
+    }
+
+    pub fn from_args(args: RcList<Type>) -> Self {
+        Self {
+            args
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FunctionDefinition {
     pub typ: Type,
     pub argnames: Vec<Ident>,
-
     pub body_info: Option<FunctionBodyInfo>,
+    pub gen_info: Option<GenericInfo>
+}
+
+impl FunctionDefinition {
+    pub fn is_declare(&self) -> bool {
+        self.body_info.is_none()
+    }
 }
 
 #[derive(Debug)]
@@ -85,7 +115,100 @@ pub enum DefinitionKind {
     Parameter(Type),
     Function(FunctionDefinition),
     Type(TypeDefinition),
+    PlaceholderType,
     Scope(ArenaID<Scope>),
+}
+
+pub type RcList<T> = Rc<[T]>;
+
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
+pub enum SymbolRef {
+    Basic(ArenaID<Definition>),
+    Generic(ArenaID<Definition>, RcList<Type>)
+}
+
+impl From<ArenaID<Definition>> for SymbolRef {
+    fn from(value: ArenaID<Definition>) -> Self {
+        Self::Basic(value)
+    }
+}
+impl<'a> From<&'a ArenaID<Definition>> for SymbolRef {
+    fn from(value: &'a ArenaID<Definition>) -> Self {
+        Self::Basic(*value)
+    }
+}
+
+
+impl SymbolRef {
+    pub fn id(&self) -> ArenaID<Definition> {
+        match self {
+            Self::Basic(x) => *x,
+            Self::Generic(x, ..) => *x
+        }
+    }
+    pub fn gen_args_src(&self, defs: &Definitions) -> Option<RcList<Type>> {
+        match self {
+            Self::Basic(..) => None,
+            Self::Generic(x, ..) => {
+                let x = x.get(defs);
+                x.gen_args().cloned()
+            }
+        }
+    }
+    pub fn gen_args_this(&self) -> Option<RcList<Type>> {
+        match self {
+            Self::Basic(..) => None,
+            Self::Generic(_, g) => Some(g.clone()),
+        }
+    }
+    pub fn gen_args(&self, defs: &Definitions) -> Option<(RcList<Type>, RcList<Type>)> {
+        match self {
+            Self::Basic(..) => None,
+            Self::Generic(x, g) => Some((x.get(defs).gen_args().unwrap().clone(), g.clone())),
+        }
+    }
+    pub fn replace_all<'a>(&'a self, old: &[Type], new: &[Type]) -> Cow<'a, Self> {
+        match self {
+            Self::Basic(..) => Cow::Borrowed(self),
+            Self::Generic(x, args) => {
+                Cow::Owned(Self::Generic(
+                    *x,
+                    args.to_vec()
+                        .iter_mut()
+                        .map(|t| {t.replace_all(old, new); t.clone()})
+                        .collect()
+                ))
+            }
+        }
+    }
+
+    // TODO: needing to copy around defs and scopes! is this necessary, or can these be static?
+    pub fn get_type(&self, defs: &Definitions, _scopes: &Arena<Scope>) -> Type {
+        match self {
+            Self::Basic(x) => x.get(defs).get_type().clone(),
+            Self::Generic(x, args) => {
+                let def = x.get(defs);
+                
+                // TODO: necessary to have this logic here?
+                match &def.kind {
+                    DefinitionKind::Type(..) => Type::Gen(*x, args.to_vec()),
+                    DefinitionKind::Function(func) => {
+                        let ty = func.get_type();
+                        ty.replaced_all(&func.gen_info.as_ref().unwrap().args, args)
+                    }
+
+                    k => panic!("Symbol references cannot contain {k:?}")
+                }
+            }
+        }
+    }
+    pub fn compiled_name(&self, defs: &Definitions, scopes: &Arena<Scope>) -> String {
+        if let Some(gargs) = self.gen_args_this() {
+            self.id().get(defs).compiled_name_with_args(&gargs, defs, scopes)
+        } else {
+            self.id().get(defs).compiled_name(scopes)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,12 +218,20 @@ pub struct Definition {
     pub kind: DefinitionKind,
 }
 
+impl ArenaValue for Definition {
+    fn assign_id(&mut self, id: ArenaID<Self>) {
+        if let DefinitionKind::Type(td) = &mut self.kind {
+            td.typ = Type::Ref(id);
+        }
+    }
+}
+
 impl Definition {
     pub fn name(&self) -> &Ident {
         &self.name
     }
     pub fn full_name(&self, scopes: &Arena<Scope>) -> String {
-        self.scope.get(&scopes).full_name(&scopes) + "::" + self.name.as_str()
+        self.scope.get(&scopes).full_name_of(self.name.as_str(), scopes)
     }
 
     pub fn compiled_name(&self, scopes: &Arena<Scope>) -> String {
@@ -118,6 +249,10 @@ impl Definition {
 
             _ => self.full_name(scopes),
         }
+    }
+    
+    pub fn compiled_name_with_args(&self, args: &[Type], defs: &Arena<Definition>, scopes: &Arena<Scope>) -> String {
+        self.compiled_name(scopes) + "::<>gen[" + args.iter().map(|x| x.full_name(defs, scopes)).collect::<Vec<_>>().join(";").as_str() + "]"
     }
 
     pub fn scope(&self) -> ArenaID<Scope> {
@@ -141,6 +276,7 @@ impl Definition {
         typ: Type,
         argnames: Vec<Ident>,
         scope: ArenaID<Scope>,
+        gen_info: Option<GenericInfo>
     ) -> Definition {
         Self::new(
             name,
@@ -148,6 +284,7 @@ impl Definition {
                 typ,
                 argnames,
                 body_info: Some(FunctionBodyInfo::from_scope(scope)),
+                gen_info
             }),
         )
     }
@@ -158,6 +295,7 @@ impl Definition {
                 typ,
                 argnames,
                 body_info: None,
+                gen_info: None
             }),
         )
     }
@@ -205,12 +343,22 @@ impl Definition {
     }
 
     pub fn try_get_type(&self) -> Option<&Type> {
-        match self.kind {
-            DefinitionKind::Variable(ref typ) => Some(typ),
-            DefinitionKind::Parameter(ref typ) => Some(typ),
-            DefinitionKind::Function(FunctionDefinition { ref typ, .. }) => Some(typ),
+        match &self.kind {
+            DefinitionKind::Variable(typ) => Some(typ),
+            DefinitionKind::Parameter(typ) => Some(typ),
+            DefinitionKind::Function(FunctionDefinition { typ, .. }) => Some(typ),
+            DefinitionKind::Type(td) => Some(&td.typ),
 
-            DefinitionKind::Type(..) | DefinitionKind::Scope(..) => None,
+            DefinitionKind::Scope(..) | DefinitionKind::PlaceholderType => None,
+        }
+    }
+
+    pub fn gen_args(&self) -> Option<&RcList<Type>> {
+        match &self.kind {
+            DefinitionKind::Function(f) => f.gen_info.as_ref().map(|x| &x.args),
+            DefinitionKind::Type(t) => Some(&t.gen_args),
+
+            _ => None
         }
     }
 }
@@ -263,15 +411,17 @@ impl Scopes {
     pub fn create(&mut self) -> ArenaID<Scope> {
         self.arena.add(Scope::new(self.current))
     }
-    pub fn create_named(&mut self, name: Ident, defs: &mut Definitions) -> ArenaID<Scope> {
+    pub fn create_named(&mut self, name: Ident, defs: &mut Definitions) -> Result<ArenaID<Scope>, ArenaID<Definition>> {
         let sc = self.arena.add(Scope::new_named(self.current, name.clone()));
         self.cur_mut()
-            .define_lit(Definition::new(name, DefinitionKind::Scope(sc)), defs);
-        sc
+            .define_lit(Definition::new(name, DefinitionKind::Scope(sc)), defs)?;
+        Ok(sc)
     }
 
-    pub fn enter(&mut self, scope: ArenaID<Scope>) {
+    pub fn enter(&mut self, scope: ArenaID<Scope>) -> ArenaID<Scope> {
+        let c = self.current;
         self.current = scope;
+        c
     }
 
     pub fn exit(&mut self) {
@@ -353,7 +503,7 @@ impl Scope {
     }
     pub fn full_name(&self, arena: &Arena<Scope>) -> String {
         match self.parent {
-            None => "<global>".into(),
+            None => "".into(),
             Some(p) => match &self.name {
                 None => p.get(arena).full_name(arena),
                 Some(n) => if p == Default::default() {n.as_str().to_owned()} else {
@@ -362,28 +512,37 @@ impl Scope {
             },
         }
     }
+    pub fn full_name_of(&self, child: &str, arena: &Arena<Scope>) -> String {
+        let full = self.full_name(arena);
+        if full.is_empty() { child.to_owned() } else { full + "::" + child }
+    }
 
     pub fn id(&self) -> ArenaID<Scope> {
         self.id
             .expect("ID should never be called before a scope is added to a scope arena!")
     }
 
-    pub fn define(&mut self, definition: ArenaID<Definition>, defs: &mut Arena<Definition>) {
+    pub fn define(&mut self, definition: ArenaID<Definition>, defs: &mut Arena<Definition>) -> Result<(), ArenaID<Definition>> {
         let mut def_mut = definition.get_mut(defs);
         def_mut.set_scope(self.id());
 
-        self.definitions
-            .insert(definition.get(&defs).name().clone(), definition);
+        match self.definitions.entry(definition.get(&defs).name().clone()) {
+            Entry::Occupied(o) => Err(*o.get()),
+            Entry::Vacant(v) => {
+                v.insert(definition);
+                Ok(())
+            }
+        }
     }
 
     pub fn define_lit(
         &mut self,
         definition: Definition,
         defs: &mut Arena<Definition>,
-    ) -> ArenaID<Definition> {
+    ) -> Result<ArenaID<Definition>, ArenaID<Definition>> {
         let def = defs.add(definition);
-        self.define(def, defs);
-        def
+        self.define(def, defs)?;
+        Ok(def)
     }
 
     pub fn definitions(&self) -> &HashMap<Ident, ArenaID<Definition>> {
@@ -461,7 +620,12 @@ pub type Definitions = Arena<Definition>;
 pub struct ProgramContext {
     pub diags: DiagnosticHandler,
     pub scopes: Scopes,
-    pub defs: Definitions
+    pub defs: Definitions,
+
+    pub declared_fns: HashSet<String>,
+
+    pub cur_func_ty: Option<FunctionType>,
+    pub inside_loop: bool,
 }
 
 impl ProgramContext {
@@ -469,7 +633,12 @@ impl ProgramContext {
         ProgramContext {
             diags: DiagnosticHandler::new(),
             scopes: Scopes::new(),
-            defs: Arena::new()
+            defs: Arena::new(),
+
+            declared_fns: HashSet::new(),
+
+            cur_func_ty: None,
+            inside_loop: false
         }
     }
 }
@@ -547,13 +716,13 @@ impl BoundStmtAST {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BoundBinary {
     pub lhs: Box<BoundExprAST>,
     pub rhs: Box<BoundExprAST>,
 }
 
-#[derive(Debug, Symbol)]
+#[derive(Debug, Clone, Symbol)]
 pub enum BoundExpr {
     Error,
     None,
@@ -585,9 +754,12 @@ pub enum BoundExpr {
 
     Symbol(ArenaID<Definition>),
 
+    Type(SymbolRef),
+    Fn(SymbolRef),
+
     Dot(Box<BoundExprAST>, usize),
 
-    DirectCall(ArenaID<Definition>, Vec<BoundExprAST>),
+    DirectCall(Box<BoundExprAST>, Vec<BoundExprAST>),
     IndirectCall(Box<BoundExprAST>, Vec<BoundExprAST>),
 
     Cast(Box<BoundExprAST>, Type),
@@ -595,11 +767,37 @@ pub enum BoundExpr {
     Deref(Box<BoundExprAST>),
 
     VariableRef(ArenaID<Definition>),
+
     DotRef(Box<BoundExprAST>, usize),
-    DerefRef(Box<BoundExprAST>)
+    DerefRef(Box<BoundExprAST>),
+
+    Sizeof(Type)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ValueKind {
+    L, R
+}
+
+impl BoundExprAST {
+    pub fn auto_deref(&self, kind: ValueKind) -> BoundExprAST {
+        let mut out = self.clone();
+        while let Some(df) = out.get_type().deref().cloned() {
+            if df.is_error() {break}
+            if kind == ValueKind::L && df.deref().is_none() {break}
+
+            out = AST::new(
+                out.span.clone(),
+                Typed::new(
+                    df, BoundExpr::Deref(Box::new(out))
+                )
+            );
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BoundIf {
     pub cond: Box<BoundExprAST>,
     pub block: BoundBlock,
@@ -622,11 +820,12 @@ impl BoundIf {
     }
 }
 
-#[derive(Debug, Symbol)]
+#[derive(Debug, Symbol, Clone)]
 pub struct BoundBlock {
     pub scope: ArenaID<Scope>,
     pub body: Vec<BoundStmtAST>,
     pub tail: Option<Box<BoundExprAST>>,
+    pub is_terminator: bool
 }
 
 impl BoundSymbol for BoundBlock {
@@ -635,6 +834,7 @@ impl BoundSymbol for BoundBlock {
             scope: ArenaID::default(),
             body: vec![],
             tail: None,
+            is_terminator: false
         }
     }
     fn none() -> Self {
@@ -657,7 +857,7 @@ impl BoundBlock {
     }
 }
 
-#[derive(Debug, Symbol)]
+#[derive(Debug, Symbol, Clone)]
 pub enum BoundStmt {
     Error,
 
@@ -678,6 +878,35 @@ pub enum BoundStmt {
     Let {
         target: ArenaID<Definition>,
         value: Box<BoundExprAST>
+    },
+
+    Return(Option<BoundExpr>),
+    Break,
+    Continue,
+}
+
+impl BoundExpr {
+    pub fn is_terminator(&self) -> bool {
+        match self {
+            BoundExpr::If(BoundIf {cond, block, else_block}) => {
+                cond.kind().is_terminator() || (block.kind().is_terminator && else_block.as_ref().is_some_and(|x| x.kind().is_terminator()))
+            }
+
+            BoundExpr::Block(block) => block.kind().is_terminator,
+
+            _ => false
+        }
+    }
+}
+
+impl BoundStmt {
+    pub fn is_terminator(&self) -> bool {
+        match self {
+            BoundStmt::Return(..) | BoundStmt::Break | BoundStmt::Continue => true,
+            BoundStmt::Expr(x) => x.is_terminator(),
+
+            _ => false
+        }
     }
 }
 
@@ -712,13 +941,16 @@ impl Stmt {
                 name: _,
                 body,
                 scope_id,
+                error
             } => {
+                if error.get() {return vec![]}
+
                 let exit = ctx.scopes.cur_id();
                 ctx.scopes.enter(*scope_id.get().unwrap());
 
                 let body = body
                     .iter()
-                    .flat_map(|x| x.kind().general_pass(func, ctx))
+                    .flat_map(|x| x.general_pass(func, ctx))
                     .collect();
 
                 ctx.scopes.exit_to(exit);
@@ -726,7 +958,9 @@ impl Stmt {
                 body
             }
 
-            Stmt::ModHead { name: _, scope_id } => {
+            Stmt::ModHead { name: _, scope_id, error } => {
+                if error.get() {return vec![]}
+
                 ctx.scopes.enter(*scope_id.get().unwrap());
 
                 vec![]
@@ -736,29 +970,51 @@ impl Stmt {
         }
     }
 
+    pub fn get_or_make_mod(err: &FlagCell, name: &Ident, ctx: &mut ProgramContext) -> ArenaID<Scope> {
+        let found = ctx.scopes.lookup(name);
+
+        let scope = if let Some(found) = found {
+            let found = found.get(&ctx.defs);
+            if let DefinitionKind::Scope(x) = found.kind {
+                Some(x)
+            } else {
+                // short circuit with dummy value on error
+                ctx.diags.add_error(format!("Attempt to redefine {}", ctx.scopes.cur().full_name_of(name.as_str(), &ctx.scopes.arena)));
+                err.mark();
+                return ctx.scopes.cur_id();
+            }
+        } else {None};
+
+        scope.unwrap_or_else(|| ctx.scopes.create_named(name.clone(), &mut ctx.defs).unwrap())
+    }
+
     pub fn load_mod_definitions(&self, ctx: &mut ProgramContext) {
         match self {
             Stmt::Mod {
                 name,
                 body,
                 scope_id,
+                error
             } => {
+                if error.get() {return}
+
                 let c = ctx.scopes.cur_id();
 
                 scope_id
-                    .set(ctx.scopes.create_named(name.clone(), &mut ctx.defs))
+                    .set(Self::get_or_make_mod(error, name, ctx))
                     .expect("This should be the first time this occurs!");
 
                 ctx.scopes.enter(*scope_id.get().unwrap());
 
-                body.iter().for_each(|x| x.kind().load_mod_definitions(ctx));
+                body.iter().for_each(|x| x.load_mod_definitions(ctx));
 
                 ctx.scopes.exit_to(c);
             }
 
-            Stmt::ModHead { name, scope_id } => {
+            Stmt::ModHead { name, scope_id, error } => {
+                if error.get() {return}
                 scope_id
-                    .set(ctx.scopes.create_named(name.clone(), &mut ctx.defs))
+                    .set(Self::get_or_make_mod(error, name, ctx))
                     .expect("This should be the first time this occurs!");
                 ctx.scopes.enter(*scope_id.get().unwrap());
             }
@@ -770,15 +1026,51 @@ impl Stmt {
     pub fn load_struct_definitions(&self, ctx: &mut ProgramContext) {
         match self {
             Stmt::Struct(s) => {
-                ctx.scopes.cur_mut().define_lit(
+                let scope = match ctx.scopes.create_named(Ident::from("<type>".to_owned() + s.name.as_str()), &mut ctx.defs) {
+                    Ok(x) => x,
+                    Err(..) => {
+                        ctx.diags.add_error(format!("Attempt to redefine type {}", ctx.scopes.cur().full_name_of(s.name.as_str(), &ctx.scopes.arena)));
+                        s.error.mark();
+                        return
+                    }
+                };
+
+                let mut gen_args = vec![];
+
+                for arg in &s.args {
+                    let arg = match scope.get_mut(&mut ctx.scopes.arena).define_lit(
+                        Definition::new(arg.clone(), DefinitionKind::PlaceholderType),
+                        &mut ctx.defs
+                    ) {
+                        Ok(x) => x,
+                        Err(..) => {
+                            ctx.diags.add_error(format!("Attempt to redefine generic argument {}", arg.as_str()));
+                            s.error.mark();
+                            return
+                        }
+                    };
+
+                    gen_args.push(Type::Ref(arg));
+                }
+
+                match ctx.scopes.cur_mut().define_lit(
                     Definition::new(
                         s.name.clone(),
                         DefinitionKind::Type(TypeDefinition {
-                            typ: OnceBuildable::new(),
+                            inner_type: OnceBuildable::new(),
+                            gen_args: gen_args.into(),
+                            scope,
+                            typ: Type::Error
                         }),
                     ),
                     &mut ctx.defs,
-                );
+                ) {
+                    Ok(..) => {},
+                    Err(..) => {
+                        ctx.diags.add_error(format!("Attempt to redefine type {}", ctx.scopes.cur().full_name_of(s.name.as_str(), &ctx.scopes.arena)));
+                        s.error.mark()
+                    },
+                };
             }
 
             Stmt::Mod { .. } | Self::ModHead { .. } => {
@@ -792,21 +1084,28 @@ impl Stmt {
     pub fn define_structs(&self, ctx: &mut ProgramContext) {
         match self {
             Stmt::Struct(s) => {
+                if s.error.get() {return}
+
                 let def_id = ctx.scopes.lookup(&s.name).unwrap();
                 {
                     let def = def_id.get(&ctx.defs);
                     let def = def.as_ty().unwrap();
 
-                    def.typ.begin_build();
+                    def.inner_type.begin_build();
+
+                    ctx.scopes.enter(def.scope);
                 }
 
-                let mut map = HashMap::new();
+                let mut map = LinkedHashMap::new();
 
                 for arg in s.fields.iter() {
                     let argty = arg.type_spec.bind(ctx).into_kind();
 
+                    // dbg!(&argty);
                     let argty = match argty {
-                        Type::Ref(r) if r.get(&ctx.defs).as_ty().unwrap().typ.is_building() => {
+                        Type::Ref(r) if matches!(r.get(&ctx.defs).kind, DefinitionKind::PlaceholderType) => argty,
+
+                        Type::Ref(r) if r.get(&ctx.defs).as_ty().unwrap().inner_type.is_building() => {
                             ctx.diags.add_error_at(arg.type_spec.span.clone(), 
                                 format!("Storing value of type {} in struct {} causes recursion", 
                                     r.get(&ctx.defs).full_name(&ctx.scopes.arena),
@@ -831,9 +1130,11 @@ impl Stmt {
                 let def = def_id.get(&ctx.defs);
                 let def = def.as_ty().unwrap();
 
-                def.typ
+                def.inner_type
                     .set(LitType::Struct(map))
                     .expect("This should not have been previously run.");
+
+                ctx.scopes.exit();
             }
 
             Stmt::Mod { .. } | Self::ModHead { .. } => {
@@ -846,8 +1147,29 @@ impl Stmt {
 
     pub fn load_fn_definitions(&self, ctx: &mut ProgramContext) {
         match self {
-            Stmt::Fn { name, args, ty, .. } => {
+            Stmt::Fn { name, gen_args, args, ty, body: _, error } => {
                 let scope = ctx.scopes.create();
+
+                // TODO: code duplication with struct definition!
+                let mut gen_args_ty = vec![];
+
+                for arg in gen_args {
+                    let arg = match scope.get_mut(&mut ctx.scopes.arena).define_lit(
+                        Definition::new(arg.clone(), DefinitionKind::PlaceholderType),
+                        &mut ctx.defs
+                    ) {
+                        Ok(x) => x,
+                        Err(..) => {
+                            ctx.diags.add_error(format!("Attempt to redefine generic argument {}", arg.as_str()));
+                            error.mark();
+                            return
+                        }
+                    };
+
+                    gen_args_ty.push(Type::Ref(arg));
+                }
+
+                let cur = ctx.scopes.enter(scope);
 
                 let func = Definition::function(
                     name.clone(),
@@ -859,21 +1181,33 @@ impl Stmt {
                         ),
                         args: args
                             .iter()
-                            .map(|arg| arg.type_spec.bind_content(ctx))
+                            .map(|arg| arg.content.type_spec.bind_content(ctx))
                             .map(Box::new)
                             .collect(),
+                        vararg: false
                     })
                     .into(),
-                    args.iter().map(|arg| arg.name.clone()).collect(),
+                    args.iter().map(|arg| arg.content.name.clone()).collect(),
                     scope,
+                    if gen_args_ty.is_empty() {None} else {Some(GenericInfo::from_args(gen_args_ty.into()))},
                 );
+
+                ctx.scopes.exit_to(cur);
 
                 let func = ctx.defs.add(func);
 
-                ctx.scopes.cur_mut().define(func, &mut ctx.defs);
+                if let Err(..) = ctx.scopes.cur_mut().define(func, &mut ctx.defs) {
+                    ctx.diags.add_error(format!("Attempt to redefine function {}", func.get(&ctx.defs).full_name(&ctx.scopes.arena)));
+                    error.mark();
+                }
             }
 
-            Stmt::DeclareFn { name, args, ty } => {
+            Stmt::DeclareFn { name, args, ty, vararg } => {
+                
+                if ctx.declared_fns.contains(name.as_str()) {
+                    ctx.diags.add_error(format!("Attempt to redefine external function {}", name.as_str()));
+                }
+
                 let func = Definition::function_decl(
                     name.clone(),
                     FunctionType {
@@ -887,6 +1221,8 @@ impl Stmt {
                             .map(|arg| arg.type_spec.bind_content(ctx))
                             .map(Box::new)
                             .collect(),
+
+                        vararg: *vararg
                     }
                     .into(),
                     args.iter().map(|arg| arg.name.clone()).collect(),
@@ -894,7 +1230,11 @@ impl Stmt {
 
                 let func = ctx.defs.add(func);
 
-                ctx.scopes.cur_mut().define(func, &mut ctx.defs);
+                if let Err(..) = ctx.scopes.cur_mut().define(func, &mut ctx.defs) {
+                    ctx.diags.add_error(format!("Attempt to redefine function {}", func.get(&ctx.defs).full_name(&ctx.scopes.arena)));
+                }
+
+                ctx.declared_fns.insert(name.to_string());
             }
 
             Self::Mod { .. } | Self::ModHead { .. } => {
@@ -930,8 +1270,8 @@ impl UnboundSymbol for Stmt {
                     if !ty.compatible(&valty) {
                         ctx.diags.add_error(format!(
                             "Incompatible type between assignee ({}) and initializer ({})",
-                            ty.to_string(&ctx.defs, &ctx.scopes.arena),
-                            valty.to_string(&ctx.defs, &ctx.scopes.arena)
+                            ty.full_name(&ctx.defs, &ctx.scopes.arena),
+                            valty.full_name(&ctx.defs, &ctx.scopes.arena)
                         ));
                         return Self::Bound::error();
                     } else {
@@ -946,7 +1286,10 @@ impl UnboundSymbol for Stmt {
                 let var = ctx
                     .defs
                     .add(Definition::new(name.clone(), DefinitionKind::Variable(ty)));
-                ctx.scopes.cur_mut().define(var, &mut ctx.defs);
+
+                if let Err(..) = ctx.scopes.cur_mut().define(var, &mut ctx.defs) {
+                    ctx.diags.add_error(format!("Attempt to redefine {}", var.get(&ctx.defs).name().as_str()))
+                }
 
                 Typed::new(
                     valty,
@@ -964,11 +1307,11 @@ impl UnboundSymbol for Stmt {
                 let value = rhs.bind(ctx);
                 let valty = value.get_type().clone();
 
-                if !ty.ptr_compatible(&valty) {
+                if !ty.deref_compatible(&valty) {
                     ctx.diags.add_error(format!(
                         "Incompatible type between assignee ({}) and value ({})",
-                        ty.to_string(&ctx.defs, &ctx.scopes.arena),
-                        valty.to_string(&ctx.defs, &ctx.scopes.arena)
+                        ty.full_name(&ctx.defs, &ctx.scopes.arena),
+                        valty.full_name(&ctx.defs, &ctx.scopes.arena)
                     ));
                     return Self::Bound::error();
                 }
@@ -988,12 +1331,73 @@ impl UnboundSymbol for Stmt {
                 Typed::new(e.get_type().clone(), BoundStmt::Expr(e.into_kind()))
             }
 
+            Stmt::Break => {
+                if !ctx.inside_loop {
+                    ctx.diags.add_error(format!("Cannot 'break' outside of a loop"));
+                    Typed::error()
+                } else {
+                    Typed::new(
+                        Type::unit(),
+                        BoundStmt::Break
+                    )
+                }
+            }
+            
+            Stmt::Continue => {
+                if !ctx.inside_loop {
+                    ctx.diags.add_error(format!("Cannot 'continue' outside of a loop"));
+                    Typed::error()
+                } else {
+                    Typed::new(
+                        Type::unit(),
+                        BoundStmt::Continue
+                    )
+                }
+            }
+            
+            Stmt::Return(expr) => {
+                let expr = expr.as_ref().map(|x| x.bind(ctx));
+
+                match expr {
+                    None => if !ctx.cur_func_ty.as_ref().unwrap().ret.compatible(Type::unit_ref()) {
+                        ctx.diags.add_error(format!(
+                            "Cannot return without a value from a function of type {}",
+                            ctx.cur_func_ty.as_ref().unwrap().full_name(&ctx.defs, &ctx.scopes.arena)
+                        ));
+                        Typed::error()
+                    } else {
+                        Typed::new(
+                            Type::unit(),
+                            BoundStmt::Return(None)
+                        )
+                    },
+                    
+                    Some(expr) => if !ctx.cur_func_ty.as_ref().unwrap().ret.compatible(expr.get_type()) {
+                        ctx.diags.add_error(format!(
+                            "Cannot return a value of type {} from a function of type {}",
+                            expr.get_type().full_name(&ctx.defs, &ctx.scopes.arena),
+                            ctx.cur_func_ty.as_ref().unwrap().full_name(&ctx.defs, &ctx.scopes.arena)
+                        ));
+                        Typed::error()
+                    } else {
+                        Typed::new(
+                            Type::unit(),
+                            BoundStmt::Return(Some(expr.into_kind()))
+                        )
+                    }
+                }
+            }
+
             Stmt::Fn {
                 name,
-                args: _,
+                gen_args: _,
+                args,
                 ty: _,
                 body,
+                error
             } => {
+                if error.get() {return Typed::error()}
+
                 let def = ctx
                     .scopes
                     .lookup(name)
@@ -1009,8 +1413,9 @@ impl UnboundSymbol for Stmt {
                 };
 
                 ctx.scopes.enter(scope);
+                ctx.cur_func_ty = Some(ty.clone());
 
-                for (typ, name) in ty.args.iter().zip(argnames.clone().iter()) {
+                for (typ, (name, spec)) in ty.args.iter().zip(argnames.clone().iter().zip(args)) {
                     let param = ctx.scopes.cur_mut().define_lit(
                         Definition::new(
                             name.clone(),
@@ -1018,6 +1423,14 @@ impl UnboundSymbol for Stmt {
                         ),
                         &mut ctx.defs,
                     );
+
+                    let param = match param {
+                        Ok(x) => x,
+                        Err(x) => {
+                            ctx.diags.add_error_at(spec.span.clone(), format!("Duplicate argument {}", name.as_str()));
+                            x
+                        }
+                    };
 
                     def.get_mut(&mut ctx.defs)
                         .as_fn_mut()
@@ -1032,13 +1445,14 @@ impl UnboundSymbol for Stmt {
                 let body = body.bind(ctx);
                 let bodyty = body.get_type();
 
+                ctx.cur_func_ty = None;
                 ctx.scopes.exit();
 
                 if !ty.ret.compatible(bodyty) {
                     ctx.diags.add_error(format!(
                         "Function expects return of type {} but got {}",
-                        ty.ret.to_string(&ctx.defs, &ctx.scopes.arena),
-                        bodyty.to_string(&ctx.defs, &ctx.scopes.arena)
+                        ty.ret.full_name(&ctx.defs, &ctx.scopes.arena),
+                        bodyty.full_name(&ctx.defs, &ctx.scopes.arena)
                     ));
                     Typed::error()
                 } else {
@@ -1050,13 +1464,19 @@ impl UnboundSymbol for Stmt {
                 }
             }
 
-            Stmt::While { cond, block } => Typed::new(
-                Type::none(),
-                BoundStmt::While {
-                    cond: cond.bind(ctx),
-                    block: block.bind(ctx).into_kind(),
-                },
-            ),
+            Stmt::While { cond, block } => {
+                ctx.inside_loop = true;
+                let block = block.bind(ctx).into_kind();
+                ctx.inside_loop = false;
+
+                Typed::new(
+                    Type::none(),
+                    BoundStmt::While {
+                        cond: cond.bind(ctx),
+                        block
+                    },
+                )
+            }
 
             Stmt::DeclareFn { .. } => Typed::none(),
 
@@ -1131,9 +1551,8 @@ impl UnboundSymbol for TypeSpec {
                     Type::Ref(lookup)
                 } else {
                     ctx.diags.add_error(format!(
-                        "Unknown type {}::{}",
-                        scope.get(&ctx.scopes.arena).full_name(&ctx.scopes.arena),
-                        n.as_str()
+                        "Unknown type {}",
+                        scope.get(&ctx.scopes.arena).full_name_of(n.as_str(), &ctx.scopes.arena)
                     ));
                     Type::error()
                 }
@@ -1149,6 +1568,18 @@ impl UnboundSymbol for TypeSpec {
             TypeSpec::RefMove(inner) => {
                 LitType::Ref(Box::new(inner.bind_content(ctx)), RefKind::Move).into()
             }
+
+            TypeSpec::Gen(base, args) => {
+                let base = base.bind(ctx);
+                match &base {
+                    Type::Ref(x) => Type::Gen(*x, args.iter().map(|x| x.bind(ctx)).collect()),
+
+                    _ => {
+                        ctx.diags.add_error(format!("Cannot parameterize non-generic type"));
+                        Type::Error
+                    }
+                }
+            }
         }
     }
 }
@@ -1160,10 +1591,34 @@ impl UnboundSymbol for Block {
         let scope = ctx.scopes.create();
         ctx.scopes.enter(scope);
 
+        let mut body = vec![];
+        let mut unreachable = vec![];
+
+        let mut terminated = false;
+
+        for stmt in &self.body {
+            let stmt = stmt.bind(ctx);
+            let is_term = stmt.kind().is_terminator();
+
+            if terminated {&mut unreachable} else {&mut body}.push(stmt);
+
+            if is_term {
+                terminated = true;
+            }
+        }
+
+        if !unreachable.is_empty() {
+            let span = unreachable[0].span.clone() + unreachable[unreachable.len() - 1].span.clone();
+            ctx.diags.add_warning_at(span, format!("Unreachable code"));
+        }
+
+        let tail = self.tail.as_ref().map(|e| e.bind(ctx)).map(Box::new);
+
         let block = BoundBlock {
             scope,
-            body: self.body.iter().map(|e| e.bind(ctx)).collect(),
-            tail: self.tail.as_ref().map(|e| e.bind(ctx)).map(Box::new),
+            body,
+            tail,
+            is_terminator: terminated
         };
 
         ctx.scopes.exit();
@@ -1235,7 +1690,7 @@ impl Expr {
                 let op = op.bind(ctx);
 
                 match op.get_type() {
-                    Type::Literal(LitType::Ptr(..)) => {
+                    Type::Literal(LitType::Ptr(..)) | Type::Literal(LitType::Ref(..)) => {
                         Typed::new(
                             op.get_type().clone(),
                             BoundExpr::DerefRef(Box::new(op))
@@ -1252,12 +1707,54 @@ impl Expr {
                 }
             }
 
+            Expr::Dot { op, id } => {
+                let lhs = op.bind_as_lvalue(ctx);
+                let lhs = lhs.auto_deref(ValueKind::L);
+
+                // dbg!(&lhs);
+
+                let ty = lhs.get_type().deref().unwrap();
+
+                match ty.dot(id, &ctx.defs) {
+                    Ok((i, ty)) => Typed::new(
+                        Type::Literal(LitType::Ptr(Box::new(ty))), 
+                        BoundExpr::DotRef(Box::new(lhs), i)
+                    ),
+
+                    Err(DotError::NoFieldFound) => {
+                        ctx.diags.add_error(format!(
+                            "No member {} in type {}",
+                            id.as_str(),
+                            ty.full_name(&ctx.defs, &ctx.scopes.arena)
+                        ));
+                        Typed::error()
+                    }
+
+                    Err(DotError::NotAStructure) => {
+                        if ty.not_error() {
+                            ctx.diags
+                                .add_error(format!("Left side of '.' must be a structure type"));
+                        }
+                        Typed::error()
+                    }
+                }
+            }
+
             Expr::Error => Typed::error(),
 
             _ => {
-                ctx.diags
-                    .add_error(format!("Expected an l-value"));
-                Typed::error()
+                let op = self.bind(ctx);
+
+                match op.get_type() {
+                    Type::Literal(LitType::Ref(..)) => op,
+                    Type::Error => Typed::error(),
+
+                    _ => {
+                        ctx.diags
+                            .add_error(format!("Expected an l-value"));
+                        Typed::error()
+                    }
+                }
             }
         }
     }
@@ -1282,6 +1779,65 @@ impl UnboundSymbol for Expr {
     fn bind(&self, ctx: &mut ProgramContext) -> Typed<BoundExpr> {
         match self {
             Expr::Error => Typed::error(),
+
+            Expr::Gen { op, args } => {
+                let lhs = op.bind(ctx);
+
+                match lhs.kind() {
+                    BoundExpr::Fn(func) => {
+                        let args: RcList<_> = args.iter().map(|x| x.bind_content(ctx)).collect();
+                        
+                        let func_id = func.id();
+
+                        let mut func = func_id.get_mut(&mut ctx.defs);
+                        let func = func
+                            .as_fn_mut()
+                            .unwrap();
+
+                        let gen_info = func.gen_info.as_mut().unwrap();
+                        
+                        if gen_info.args.len() != args.len() {
+                            ctx.diags.add_error(format!("Incorrect number of generic arguments"));
+                        }
+
+                        let mut typ = lhs.get_type().clone();
+                        typ.replace_all(&gen_info.args, &args);
+
+                        Typed::new(
+                            typ,
+                            BoundExpr::Fn(SymbolRef::Generic(func_id, args))
+                        )
+                    },
+                    BoundExpr::Type(ty) => {
+                        let args: RcList<_> = args.iter().map(|x| x.bind_content(ctx)).collect();
+
+                        let ty_id = ty.id();
+
+                        let ty = ty_id.get(&ctx.defs);
+                        let ty = ty.as_ty().unwrap();
+
+                        if ty.gen_args.len() != args.len() {
+                            ctx.diags.add_error(format!("Incorrect number of generic arguments"));
+                        }
+
+                        dbg!(ty_id);
+
+                        Typed::new(
+                            Type::unit(),
+                            BoundExpr::Type(SymbolRef::Generic(ty_id, args))
+                        )
+                    },
+                    
+                    _ => {
+                        if lhs.not_error() {
+                            ctx.diags
+                                .add_error(format!("Left hand side of ::[...] must be a type or function"));
+                        }
+    
+                        Typed::error()
+                    }
+                }
+            }
             
             Expr::StaticDot { op, id } => {
                 let lhs = op.bind(ctx);
@@ -1295,7 +1851,11 @@ impl UnboundSymbol for Expr {
                                 l.get(&ctx.defs)
                                     .try_get_type()
                                     .map_or(Type::unit(), Type::clone),
-                                BoundExpr::Symbol(l),
+                                match &l.get(&ctx.defs).kind {
+                                    DefinitionKind::Function(..) => BoundExpr::Fn(SymbolRef::Basic(l)),
+                                    DefinitionKind::Type(..) => BoundExpr::Type(SymbolRef::Basic(l)),
+                                    _ => BoundExpr::Symbol(l)
+                                },
                             )
                         } else {
                             ctx.diags.add_error(format!(
@@ -1315,7 +1875,7 @@ impl UnboundSymbol for Expr {
                 } else {
                     if lhs.not_error() {
                         ctx.diags
-                            .add_error(format!("Left hand side of :: must be a symbol!"));
+                            .add_error(format!("Left hand side of :: must be a symbol"));
                     }
 
                     Typed::error()
@@ -1324,38 +1884,27 @@ impl UnboundSymbol for Expr {
 
             Expr::Dot { op, id } => {
                 let lhs = op.bind(ctx);
+                let lhs = lhs.auto_deref(ValueKind::R);
 
-                match lhs.get_type() {
-                    Type::Ref(x) => {
-                        let x = x.get(&ctx.defs);
-                        let typ = x.as_ty().unwrap().typ.get().unwrap();
 
-                        match typ {
-                            LitType::Struct(hm) => {
-                                if let Some((i, ty)) = hm.get(id) {
-                                    Typed::new(ty.clone(), BoundExpr::Dot(Box::new(lhs), *i))
-                                } else {
-                                    // TODO: implement full name for all definitions
-                                    ctx.diags.add_error(format!(
-                                        "No member {} in type {}",
-                                        id.as_str(),
-                                        x.name.as_str()
-                                    ));
-                                    Typed::error()
-                                }
-                            }
+                let ty = lhs.get_type();
 
-                            // TODO: code duplication! ew!
-                            _ => {
-                                ctx.diags.add_error(format!(
-                                    "Left side of '.' must be a structure type"
-                                ));
-                                Typed::error()
-                            }
-                        }
+                match ty.dot(id, &ctx.defs) {
+                    Ok((i, ty)) => Typed::new(
+                        ty, 
+                        BoundExpr::Dot(Box::new(lhs), i)
+                    ),
+
+                    Err(DotError::NoFieldFound) => {
+                        ctx.diags.add_error(format!(
+                            "No member {} in type {}",
+                            id.as_str(),
+                            ty.full_name(&ctx.defs, &ctx.scopes.arena)
+                        ));
+                        Typed::error()
                     }
 
-                    ty => {
+                    Err(DotError::NotAStructure) => {
                         if ty.not_error() {
                             ctx.diags
                                 .add_error(format!("Left side of '.' must be a structure type"));
@@ -1369,7 +1918,7 @@ impl UnboundSymbol for Expr {
                 let op = op.bind(ctx);
 
                 match op.get_type() {
-                    Type::Literal(LitType::Ptr(ty)) => {
+                    Type::Literal(LitType::Ptr(ty)) | Type::Literal(LitType::Ref(ty, ..)) => {
                         Typed::new(
                             (**ty).clone(),
                             BoundExpr::Deref(Box::new(op))
@@ -1389,6 +1938,28 @@ impl UnboundSymbol for Expr {
             Expr::Addressof(op) => {
                 op.kind().bind_as_lvalue(ctx)
             }
+            
+            Expr::Ref(op) => {
+                let op = op.kind().bind_as_lvalue(ctx);
+                let deref = match op.get_type().deref() {
+                    Some(x) => x,
+                    None => {
+                        if op.get_type().not_error() {
+                            ctx.diags.add_error(format!(
+                                "Could not take a reference to type {}", 
+                                op.get_type().full_name(&ctx.defs, &ctx.scopes.arena)
+                            ));
+                        }
+
+                        return Typed::error();
+                    }
+                };
+
+                Typed::new(
+                    Type::Literal(LitType::Ref(Box::new(deref.clone()), RefKind::Plain)),
+                    op.into_kind()
+                )
+            }
 
             Expr::Block(block) => {
                 let block = block.bind(ctx);
@@ -1407,6 +1978,11 @@ impl UnboundSymbol for Expr {
             Expr::Decimal(decimal, typ) => Typed::new(
                 typ.clone().unwrap_or(FloatType::F32.into()),
                 BoundExpr::Decimal(*decimal),
+            ),
+
+            Expr::Sizeof(ty) => Typed::new(
+                UIntType::USize.into(),
+                BoundExpr::Sizeof(ty.bind(ctx))
             ),
 
             Expr::String(x) => {
@@ -1431,9 +2007,15 @@ impl UnboundSymbol for Expr {
                 let def_id = def.unwrap();
                 let def = def_id.get(&ctx.defs);
 
+                let ty = def.try_get_type().map_or(Type::unit(), Type::clone);
+
                 Typed::new(
-                    def.try_get_type().map_or(Type::unit(), Type::clone),
-                    BoundExpr::Symbol(def_id),
+                    ty,
+                    match &def.kind {
+                        DefinitionKind::Function(..) => BoundExpr::Fn(SymbolRef::Basic(def_id)),
+                        DefinitionKind::Type(..) => BoundExpr::Type(SymbolRef::Basic(def_id)),
+                        _ => BoundExpr::Symbol(def_id)
+                    }
                 )
             }
 
@@ -1448,7 +2030,7 @@ impl UnboundSymbol for Expr {
                         } else {
                             ctx.diags.add_error(format!(
                                 "Cannot negate value of type {}",
-                                ty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                ty.full_name(&ctx.defs, &ctx.scopes.arena)
                             ));
                             Typed::error()
                         }
@@ -1460,7 +2042,7 @@ impl UnboundSymbol for Expr {
                         } else {
                             ctx.diags.add_error(format!(
                                 "Cannot apply not to value of non-boolean type {}",
-                                ty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                ty.full_name(&ctx.defs, &ctx.scopes.arena)
                             ));
                             Typed::error()
                         }
@@ -1481,7 +2063,7 @@ impl UnboundSymbol for Expr {
                             if !matches!(arith, ArithOp::Add | ArithOp::Subtract) {
                                 ctx.diags.add_error(format!(
                                     "Cannot perform operation {arith} on pointer type {}",
-                                    lty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                    lty.full_name(&ctx.defs, &ctx.scopes.arena)
                                 ));
                                 Typed::error()
                             } else if !matches!(
@@ -1490,8 +2072,8 @@ impl UnboundSymbol for Expr {
                             ) {
                                 ctx.diags.add_error(format!(
                                     "Cannot perform operation {arith} on pointer type {} with type {}", 
-                                    lty.to_string(&ctx.defs, &ctx.scopes.arena),
-                                    rty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                    lty.full_name(&ctx.defs, &ctx.scopes.arena),
+                                    rty.full_name(&ctx.defs, &ctx.scopes.arena)
                                 ));
                                 Typed::error()
                             } else {
@@ -1509,8 +2091,8 @@ impl UnboundSymbol for Expr {
                         } else if lty != rty && lty.not_error() {
                             ctx.diags.add_error(format!(
                                 "Cannot perform operation {arith} on distinct types {} and {}",
-                                lty.to_string(&ctx.defs, &ctx.scopes.arena),
-                                rty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                lty.full_name(&ctx.defs, &ctx.scopes.arena),
+                                rty.full_name(&ctx.defs, &ctx.scopes.arena)
                             ));
                             Typed::error()
                         } else {
@@ -1531,8 +2113,8 @@ impl UnboundSymbol for Expr {
                         if !lty.compatible(rty) {
                             ctx.diags.add_error(format!(
                                 "Cannot compare two values of differing types {} {}",
-                                lty.to_string(&ctx.defs, &ctx.scopes.arena),
-                                rty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                lty.full_name(&ctx.defs, &ctx.scopes.arena),
+                                rty.full_name(&ctx.defs, &ctx.scopes.arena)
                             ));
                             Typed::error()
                         }
@@ -1559,14 +2141,14 @@ impl UnboundSymbol for Expr {
                         if lty != rty {
                             ctx.diags.add_error(format!(
                                 "Cannot compare two values of differing types {} {}",
-                                lty.to_string(&ctx.defs, &ctx.scopes.arena),
-                                rty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                lty.full_name(&ctx.defs, &ctx.scopes.arena),
+                                rty.full_name(&ctx.defs, &ctx.scopes.arena)
                             ));
                             Typed::error()
                         } else if *lty != LitType::Bool.into() {
                             ctx.diags.add_error(format!(
                                 "Cannot perform logic on non-boolean type {}",
-                                lty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                lty.full_name(&ctx.defs, &ctx.scopes.arena)
                             ));
                             Typed::error()
                         } else {
@@ -1588,8 +2170,8 @@ impl UnboundSymbol for Expr {
                         if !lty.compatible(rty) {
                             ctx.diags.add_error(format!(
                                 "Cannot compare two values of differing types {} {}",
-                                lty.to_string(&ctx.defs, &ctx.scopes.arena),
-                                rty.to_string(&ctx.defs, &ctx.scopes.arena)
+                                lty.full_name(&ctx.defs, &ctx.scopes.arena),
+                                rty.full_name(&ctx.defs, &ctx.scopes.arena)
                             ));
                             Typed::error()
                         } else {
@@ -1616,18 +2198,12 @@ impl UnboundSymbol for Expr {
 
                 // Handle zeroinits early
                 match func.kind() {
-                    BoundExpr::Symbol(xid) => {
-                        let x = xid.get(&ctx.defs);
-                        match &x.kind {
-                            DefinitionKind::Type(_) =>
-                                return Typed::new(
-                                    // TODO: why this so wacky?
-                                    Type::Ref(*xid),
-                                    BoundExpr::Zeroinit(Type::Ref(*xid))
-                                ),
-
-                            _ => {}
-                        }
+                    BoundExpr::Type(ty) => {
+                        let ty = ty.get_type(&ctx.defs, &ctx.scopes.arena);
+                        return Typed::new(
+                            ty.clone(),
+                            BoundExpr::Zeroinit(ty)
+                        );
                     }
 
                     _ => {}
@@ -1637,38 +2213,38 @@ impl UnboundSymbol for Expr {
                 let fty = func.get_type();
 
                 if let Some(fty) = fty.as_fn() {
-                    if args.len() != fty.args.len() {
+                    if args.len() != fty.args.len() && !fty.vararg || (args.len() < fty.args.len()) {
                         ctx.diags.add_error(format!(
                             "Incorrect number of arguments for call to function of type {}",
-                            fty.to_string(&ctx.defs, &ctx.scopes.arena)
+                            fty.full_name(&ctx.defs, &ctx.scopes.arena)
                         ));
                         Typed::error()
                     } else {
-                        for (arg, argty) in args.iter().zip(fty.args.iter()) {
+                        for (arg, argty) in args.iter().zip_or_none(fty.args.iter()) {
+                            let argty = if let Some(argty) = argty {argty} else {continue};
                             if !arg.get_type().compatible(&argty) {
                                 ctx.diags.add_error_at(
                                     arg.span.clone(),
                                     format!(
                                         "Expected argument of type {}, got {}",
-                                        argty.to_string(&ctx.defs, &ctx.scopes.arena),
-                                        arg.get_type().to_string(&ctx.defs, &ctx.scopes.arena)
+                                        argty.full_name(&ctx.defs, &ctx.scopes.arena),
+                                        arg.get_type().full_name(&ctx.defs, &ctx.scopes.arena)
                                     ),
                                 );
                                 return Typed::error();
                             }
                         }
 
-                        if let BoundExpr::Symbol(def) = func.kind() {
-                            Typed::new((*fty.ret).clone(), BoundExpr::DirectCall(*def, args))
-                        } else {
-                            panic!("Unknown function value {:?}", func.kind())
-                        }
+                        Typed::new(
+                            (*fty.ret).clone(),
+                            BoundExpr::DirectCall(Box::new(func), args)
+                        )
                     }
                 } else {
                     if fty.not_error() {
                         ctx.diags.add_error(format!(
                             "Cannot call non-function value of type {}",
-                            fty.to_string(&ctx.defs, &ctx.scopes.arena)
+                            fty.full_name(&ctx.defs, &ctx.scopes.arena)
                         ));
                     }
                     Typed::error()
@@ -1701,11 +2277,12 @@ impl UnboundSymbol for Expr {
                 ) {
                     ctx.diags.add_error(format!(
                         "Cannot cast a value of type {} to a value of {}",
-                        optyp.to_string(&ctx.defs, &ctx.scopes.arena),
-                        typ.to_string(&ctx.defs, &ctx.scopes.arena)
+                        optyp.full_name(&ctx.defs, &ctx.scopes.arena),
+                        typ.full_name(&ctx.defs, &ctx.scopes.arena)
                     ));
                     Typed::error()
                 } else {
+                    println!("CONVERSION {:?} -> {:?}", optyp, typ);
                     Typed::new(typ.clone(), BoundExpr::Cast(Box::new(op), typ))
                 }
             }
@@ -1752,7 +2329,7 @@ impl Program {
             let src = Src::new(file, ipt);
 
             let lexer = parsing::lexer::Lexer::new(src, ctx);
-            let mut parser = parsing::lexer::Parser::new(lexer);
+            let mut parser = parsing::parser::Parser::new(lexer);
 
             let ast = parser.file();
             
@@ -1798,7 +2375,7 @@ impl Program {
     }
 
 
-    pub fn bind(&mut self, ctx: &mut ProgramContext) -> BoundProgram {
+    pub fn bind(&self, ctx: &mut ProgramContext) -> BoundProgram {
 
         self.0.iter().for_each(|(_, x)| {
             x.0.iter().for_each(|x| x.load_mod_definitions(ctx));

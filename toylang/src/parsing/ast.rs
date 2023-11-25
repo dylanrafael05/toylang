@@ -5,17 +5,14 @@ use toylang_derive::Symbol;
 
 use crate::binding::ProgramContext;
 use crate::binding::Scope;
-// use crate::core::Diagnostic;
 use crate::core::arena::ArenaID;
 use crate::core::monad::Wrapper;
-// use crate::core::ops::ArithOp;
-// use crate::core::ops::CompOp;
 use crate::core::ops::ConstFloat;
 use crate::core::ops::ConstInt;
 use crate::core::ops::{BinOp, UnOp};
 use crate::core::Ident;
 use crate::core::SourceSpan;
-// use crate::types::LitType;
+use crate::core::utils::FlagCell;
 use crate::types::Type;
 
 pub trait Symbol
@@ -207,6 +204,19 @@ impl<Sym: UnboundSymbol> AST<Sym> {
 }
 
 impl AST<Stmt> {
+    pub fn general_pass<T, F: FnMut(&Stmt, &mut ProgramContext) -> T>(
+        &self,
+        func: &mut F,
+        ctx: &mut ProgramContext,
+    ) -> Vec<T>
+    {
+        ctx.diags.push_span(self.span.clone());
+        let out = self.content.general_pass(func, ctx);
+        ctx.diags.pop_span();
+
+        out
+    }
+
     // todo: this better.
     // maybe a trait?
     pub fn load_mod_definitions(&self, ctx: &mut ProgramContext) {
@@ -270,6 +280,8 @@ pub struct StructDef {
 pub struct StructDefSpec {
     pub name: Ident,
     pub fields: Vec<ArgSpec>,
+    pub args: Vec<Ident>,
+    pub error: FlagCell
 }
 
 #[derive(Debug, PartialEq, Symbol)]
@@ -278,12 +290,15 @@ pub enum Stmt {
         name: Ident,
         args: Vec<ArgSpec>,
         ty: Option<TypeSpecAST>,
+        vararg: bool
     },
     Fn {
         name: Ident,
-        args: Vec<ArgSpec>,
+        gen_args: Vec<Ident>,
+        args: Vec<AST<ArgSpec>>,
         ty: Option<TypeSpecAST>,
         body: ExprAST,
+        error: FlagCell
     },
     Let {
         name: Ident,
@@ -295,10 +310,12 @@ pub enum Stmt {
         name: Ident,
         body: Vec<StmtAST>,
         scope_id: OnceCell<ArenaID<Scope>>,
+        error: FlagCell
     },
     ModHead {
         name: Ident,
         scope_id: OnceCell<ArenaID<Scope>>,
+        error: FlagCell
     },
 
     While {
@@ -314,6 +331,10 @@ pub enum Stmt {
     Import(String),
 
     Struct(StructDefSpec),
+
+    Return(Option<ExprAST>),
+    Break,
+    Continue,
 
     Expr(ExprAST),
     Error
@@ -345,6 +366,8 @@ pub enum Expr {
     },
 
     Deref(Box<ExprAST>),
+    Ref(Box<ExprAST>),
+    
     Addressof(Box<ExprAST>),
 
     Block(Block),
@@ -358,11 +381,17 @@ pub enum Expr {
         op: Box<ExprAST>,
         id: Ident,
     },
+    Gen {
+        op: Box<ExprAST>,
+        args: Vec<TypeSpecAST>,
+    },
 
     Cast {
         op: Box<ExprAST>,
         typ: TypeSpec,
     },
+
+    Sizeof(TypeSpec),
 
     EOI, // TODO: necessary?
     Error
@@ -382,6 +411,7 @@ pub enum TypeSpec {
     Ref(Box<TypeSpecAST>),
     RefMut(Box<TypeSpecAST>),
     RefMove(Box<TypeSpecAST>),
+    Gen(Box<TypeSpec>, Vec<TypeSpec>)
 }
 
 #[derive(Debug, PartialEq, Symbol)]
@@ -409,408 +439,3 @@ pub struct File(pub Vec<StmtAST>);
 
 #[derive(Debug, Symbol)]
 pub struct Program(pub HashMap<String, File>, pub HashSet<String>);
-
-////////////////////////
-//// Implementation ////
-////////////////////////
-/* 
-
-use crate::core::Source;
-use pest::iterators::Pair;
-use pest::Parser;
-use toylang_derive::Symbol;
-
-use crate::parsing::grammar::{Grammar, Rule};
-use crate::parsing::Parseable;
-
-impl Parseable<Rule> for ArgSpec {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        let mut pairs = pair.into_inner();
-
-        let name = Ident::parse_next(source, &mut pairs);
-        let type_spec = TypeSpecAST::parse_next(source, &mut pairs);
-
-        Self { name, type_spec }
-    }
-}
-
-impl Parseable<Rule> for Block {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        let mut pairs = pair.into_inner();
-
-        let body = StmtAST::vec_parse_next(source, &mut pairs);
-        let tail = ExprAST::box_parse_next_maybe(source, &mut pairs);
-
-        Self { body, tail }
-    }
-}
-
-impl Parseable<Rule> for IfNode {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        let mut pairs = pair.into_inner();
-
-        let cond = ExprAST::box_parse_next(source, &mut pairs);
-        let block = Block::parse_next(source, &mut pairs);
-
-        let tail = match pairs.next() {
-            None => ElseKind::None,
-            Some(pair) => match pair.as_rule() {
-                Rule::else_clause => ElseKind::Else(AST::parse(source, pair)),
-                Rule::elif_clause => ElseKind::ElseIf(AST::box_parse(source, pair)),
-
-                unknown => panic!("Unknown else clause {unknown:?}"),
-            },
-        };
-
-        Self { cond, block, tail }
-    }
-}
-
-macro_rules! bin_op {
-    ($source: ident, $pair: ident; $($ma: ident => $mb: expr),+) => {{
-        let mut pairs = $pair.into_inner();
-
-        let lhs = ExprAST::box_parse_next($source, &mut pairs);
-        let op = match pairs.next().unwrap().as_rule()
-        {
-            $(Rule::$ma => $mb,)+
-
-            unknown => panic!("Unexpected operator {unknown:?}")
-        };
-        let rhs = ExprAST::box_parse_next($source, &mut pairs);
-
-        Expr::Binary {op, lhs, rhs}
-    }};
-}
-
-impl<Kind: Parseable<Rule>> Parseable<Rule> for AST<Kind> {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        Self {
-            span: SourceSpan::from(source, pair.as_span()),
-            content: Kind::parse(source, pair),
-        }
-    }
-}
-
-impl Parseable<Rule> for Stmt {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        match pair.as_rule() {
-            Rule::let_stmt => {
-                let mut pairs = pair.into_inner();
-
-                let name = Ident::parse_next(source, &mut pairs);
-                let ty = Option::<TypeSpecAST>::parse_next(source, &mut pairs);
-                let value = ExprAST::parse_next(source, &mut pairs);
-
-                Stmt::Let { name, ty, value }
-            }
-
-            Rule::fn_stmt => {
-                let mut pairs = pair.into_inner();
-
-                let name = Ident::parse_next(source, &mut pairs);
-                let args = ArgSpec::vec_parse_next(source, &mut pairs);
-                let ty = Option::<TypeSpecAST>::parse_next(source, &mut pairs);
-                let body = ExprAST::parse_next(source, &mut pairs);
-
-                Stmt::Fn {
-                    name,
-                    args,
-                    ty,
-                    body,
-                }
-            }
-
-            Rule::declare_fn_stmt => {
-                let mut pairs = pair.into_inner();
-
-                let name = Ident::parse_next(source, &mut pairs);
-                let args = ArgSpec::vec_parse_next(source, &mut pairs);
-                let ty = Option::<TypeSpecAST>::parse_next(source, &mut pairs);
-
-                Stmt::DeclareFn { name, args, ty }
-            }
-
-            Rule::while_stmt => {
-                let mut pairs = pair.into_inner();
-
-                let cond = ExprAST::parse_next(source, &mut pairs);
-                let block = Block::parse_next(source, &mut pairs);
-
-                Stmt::While { cond, block }
-            }
-
-            Rule::assgn_stmt => {
-                let mut pairs = pair.into_inner();
-
-                let lhs = ExprAST::parse_next(source, &mut pairs);
-                let rhs = ExprAST::parse_next(source, &mut pairs);
-
-                Stmt::Assign { lhs, rhs }
-            }
-
-            Rule::struct_stmt => Stmt::Struct(StructDefSpec::parse(source, pair)),
-
-            Rule::mod_stmt => {
-                let mut pairs = pair.into_inner();
-
-                Stmt::Mod {
-                    name: Ident::parse_next(source, &mut pairs),
-                    body: StmtAST::parse_rest(source, &mut pairs),
-                    scope_id: OnceCell::new(),
-                }
-            }
-
-            Rule::mod_head_stmt => Self::ModHead {
-                name: Ident::parse(source, pair.into_inner().next().unwrap()),
-                scope_id: OnceCell::new(),
-            },
-
-            _ => Stmt::Expr(ExprAST::parse(source, pair)),
-        }
-    }
-}
-
-impl Parseable<Rule> for Expr {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        match pair.as_rule() {
-            Rule::ident => Expr::Identifier(Ident::parse(source, pair)),
-
-            Rule::integer => Expr::Integer(String::parse(source, pair).parse().unwrap(), None),
-            Rule::decimal => Expr::Decimal(String::parse(source, pair).parse().unwrap(), None),
-
-            Rule::dot_expr => {
-                let mut pairs = pair.into_inner();
-
-                let mut expr = ExprAST::parse_next(source, &mut pairs);
-
-                for dots in pairs {
-                    let ident = AST::<Ident>::parse(source, dots);
-                    let espan = expr.span.clone();
-
-                    expr = ExprAST {
-                        content: Expr::Dot {
-                            op: Box::new(expr),
-                            id: ident.content,
-                        },
-                        span: espan + ident.span,
-                    };
-                }
-
-                dbg!(&expr);
-
-                expr.into_kind()
-            }
-
-            Rule::sdot_expr => {
-                let mut pairs = pair.into_inner();
-
-                let mut expr = ExprAST::parse_next(source, &mut pairs);
-
-                for dots in pairs {
-                    let ident = AST::<Ident>::parse(source, dots);
-                    let espan = expr.span.clone();
-
-                    expr = ExprAST {
-                        content: Expr::StaticDot {
-                            op: Box::new(expr),
-                            id: ident.content,
-                        },
-                        span: espan + ident.span,
-                    };
-                }
-
-                expr.into_kind()
-            }
-
-            Rule::typed_integer => {
-                // TODO: should this be hard-coded?
-                use crate::types::IntType::*;
-                use crate::types::UIntType::*;
-
-                let mut pairs = pair.into_inner();
-
-                let int = String::parse_next(source, &mut pairs).parse().unwrap();
-                let typ = match pairs.next().unwrap().as_str() {
-                    "i8" => LitType::Int(I8),
-                    "i32" => LitType::Int(I32),
-                    "i64" => LitType::Int(I64),
-                    "isize" => LitType::Int(ISize),
-
-                    "u8" => LitType::UInt(U8),
-                    "u32" => LitType::UInt(U32),
-                    "u64" => LitType::UInt(U64),
-                    "usize" => LitType::UInt(USize),
-
-                    _ => unreachable!(),
-                }
-                .into();
-
-                Expr::Integer(int, Some(typ))
-            }
-
-            Rule::typed_decimal => {
-                // TODO: should this be hard-coded?
-                use crate::types::FloatType::*;
-
-                let mut pairs = pair.into_inner();
-
-                let int = String::parse_next(source, &mut pairs).parse().unwrap();
-                let typ = match pairs.next().unwrap().as_str() {
-                    "f32" => LitType::Float(F32),
-                    "f64" => LitType::Float(F64),
-
-                    _ => unreachable!(),
-                }
-                .into();
-
-                Expr::Decimal(int, Some(typ))
-            }
-
-            Rule::call => {
-                let mut pairs = pair.into_inner();
-
-                let func = ExprAST::box_parse_next(source, &mut pairs);
-                let args = ExprAST::parse_rest(source, &mut pairs);
-
-                Expr::Call { func, args }
-            }
-
-            Rule::unary_expr => {
-                let mut pairs = pair.into_inner();
-
-                let op = match pairs.next().unwrap().as_rule() {
-                    Rule::minus => UnOp::Negate,
-                    Rule::not => UnOp::Not,
-
-                    unknown => panic!("Invalid unary operator rule {unknown:?}"),
-                };
-                let target = ExprAST::box_parse_next(source, &mut pairs);
-
-                Expr::Unary { op, target }
-            }
-
-            Rule::muldiv_expr => {
-                bin_op!(source, pair; star => BinOp::Arith(ArithOp::Multiply), slash => BinOp::Arith(ArithOp::Divide))
-            }
-            Rule::addsub_expr => {
-                bin_op!(source, pair; plus => BinOp::Arith(ArithOp::Add), minus => BinOp::Arith(ArithOp::Subtract))
-            }
-            Rule::comp_expr => bin_op!(source, pair;
-                dequal  => BinOp::Equals,
-                nequal  => BinOp::NotEquals,
-                greater => BinOp::Comparison(CompOp::GreaterThan),
-                grequal => BinOp::Comparison(CompOp::GreaterEqual),
-                less    => BinOp::Comparison(CompOp::LessThan),
-                lequal  => BinOp::Comparison(CompOp::LessEqual)
-            ),
-            Rule::or_expr => bin_op!(source, pair; or => BinOp::Or),
-            Rule::and_expr => bin_op!(source, pair; and => BinOp::And),
-
-            Rule::block => Expr::Block(Block::parse(source, pair)),
-
-            Rule::if_stmt => Expr::If(IfNode::parse(source, pair)),
-
-            // todo: it better
-            Rule::string => {
-                let str = String::parse(source, pair);
-
-                Expr::String(str.replace("\\n", "\n")[1..str.len() - 2].to_string())
-            }
-
-            Rule::deref_expr => Expr::Deref(ExprAST::box_parse(source, pair.into_inner().nth(1).unwrap())),
-            Rule::ref_expr => Expr::Addressof(ExprAST::box_parse(source, pair.into_inner().nth(1).unwrap())),
-
-            Rule::EOI => Expr::EOI,
-
-            Rule::as_expr => {
-                let mut pairs = pair.into_inner();
-                Expr::Cast {
-                    op: ExprAST::box_parse_next(source, &mut pairs),
-                    typ: TypeSpec::parse_next(source, &mut pairs)
-                }
-            }
-
-            Rule::paren_expr => Expr::parse(source, pair.into_inner().next().unwrap()),
-
-            unknown => todo!("Unfinished: {unknown:?}"),
-        }
-    }
-}
-
-impl Parseable<Rule> for Option<TypeSpecAST> {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        pair.into_inner()
-            .next()
-            .map(|p| TypeSpecAST::parse(source, p))
-    }
-}
-
-impl Parseable<Rule> for StructDefSpec {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        let mut pairs = pair.into_inner();
-
-        let name = Ident::parse_next(source, &mut pairs);
-        let fields = ArgSpec::vec_parse_next(source, &mut pairs);
-
-        Self { name, fields }
-    }
-}
-
-impl Parseable<Rule> for TypeSpec {
-    fn parse(source: &Source, pair: Pair<'_, Rule>) -> Self {
-        if pair.as_rule() != Rule::r#type {
-            panic!("Non type rule entered to parse type!");
-        }
-
-        let pair = pair.into_inner().next().unwrap();
-
-        match pair.as_rule() {
-            Rule::ident => TypeSpec::Named(pair.as_str().into()),
-            Rule::ptr_type => TypeSpec::Ptr(TypeSpecAST::box_parse(
-                source,
-                pair.into_inner().nth(1).unwrap(),
-            )),
-            Rule::ref_type => TypeSpec::Ref(TypeSpecAST::box_parse(
-                source,
-                pair.into_inner().nth(1).unwrap(),
-            )),
-            Rule::ref_mut_type => TypeSpec::RefMut(TypeSpecAST::box_parse(
-                source,
-                pair.into_inner().nth(2).unwrap(),
-            )),
-            Rule::ref_move_type => TypeSpec::RefMove(TypeSpecAST::box_parse(
-                source,
-                pair.into_inner().nth(2).unwrap(),
-            )),
-            Rule::sdot_type => {
-                let mut pairs = pair.into_inner();
-                let mut idents = Vec::new();
-
-                let mut lhs = pairs.next().unwrap();
-
-                while let Rule::sdot_type = lhs.as_rule() {
-                    idents.push(Ident::parse_next(source, &mut pairs));
-                    pairs = lhs.into_inner();
-                    lhs = pairs.next().unwrap();
-                }
-
-                TypeSpec::Scoped(idents, Ident::parse_next(source, &mut pairs))
-            }
-
-            unknown => panic!("Unknown rule {unknown:?}"),
-        }
-    }
-}
-
-pub fn parse(ipt: &str) -> Result<Program, pest::error::Error<Rule>> {
-    let source = Source::new(ipt);
-
-    Ok(Program(
-        Grammar::parse(Rule::prog, ipt)?
-            .into_iter()
-            .map(|p| StmtAST::parse(&source, p))
-            .collect(),
-    ))
-}
-*/

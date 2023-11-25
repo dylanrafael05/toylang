@@ -1,13 +1,12 @@
 import "wow.txt"
 import "std:malloc.tl"
+import "std:io.tl"
 
 declare fn puts(str *u8) i32
 
-declare fn free(_ *unit)
-
 fn int_to_str(n i32) *u8: {
     let num = n;
-    let out = malloc(100 as isize) as *u8;
+    let out = std::malloc(100 as usize) as *u8;
 
     let mem = out;
 
@@ -45,9 +44,14 @@ fn main():
 
     let y = *xp;
 
-    let ya = int_to_str(y);
+    std::printf("%d\n", sizeof *u8);
 
-    puts(ya);
+    let m = std::malloc_many(sizeof i32, 10);
+    std::free(m);
+
+    return;
+
+    puts("Fuck you");
 }
 
 mod std
@@ -55,7 +59,7 @@ mod std
     struct Test
     {
         x i32,
-        y Test
+        y i32
     }
     
     fn bruh() Test: {
@@ -70,3 +74,6 @@ fn bruh() std::Test: {
     let x = t.x;
     t
 }
+
+fn fibbonacci(n i32) i32:
+    if n <= 0 {0} else if n <= 2 {1} else {fibbonacci(n - 1) + fibbonacci(n - 1)}
